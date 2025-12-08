@@ -315,7 +315,7 @@ function IngredientsManager({ user, role, appId }) {
   const [confirmDelete, setConfirmDelete] = useState(null);
   
   const [formData, setFormData] = useState({ 
-    name: '', unit: 'g', cost: 0, supplier: '', storageArea: 'Dry Storage', forms: [] 
+    name: '', unit: 'g', cost: 0, minStock: 0, moq: 0, supplier: '', storageArea: 'Dry Storage', forms: [] 
   });
   const [newUnitName, setNewUnitName] = useState('');
   const [newUnitRatio, setNewUnitRatio] = useState('');
@@ -339,6 +339,8 @@ function IngredientsManager({ user, role, appId }) {
       const data = {
         ...formData,
         cost: parseFloat(formData.cost) || 0,
+        minStock: parseFloat(formData.minStock) || 0,
+        moq: parseFloat(formData.moq) || 0,
         ...(editingId ? {} : { currentStock: 0, createdAt: serverTimestamp() })
       };
 
@@ -360,7 +362,9 @@ function IngredientsManager({ user, role, appId }) {
 
   const startEdit = (ing) => {
     setFormData({
-      name: ing.name, unit: ing.unit, cost: ing.cost, supplier: ing.supplier || '',
+      name: ing.name, unit: ing.unit, cost: ing.cost, 
+      minStock: ing.minStock || 0, moq: ing.moq || 0,
+      supplier: ing.supplier || '',
       storageArea: ing.storageArea, forms: ing.forms || []
     });
     setEditingId(ing.id);
@@ -370,7 +374,7 @@ function IngredientsManager({ user, role, appId }) {
   const closeForm = () => {
     setIsAdding(false);
     setEditingId(null);
-    setFormData({ name: '', unit: 'g', cost: 0, supplier: '', storageArea: 'Dry Storage', forms: [] });
+    setFormData({ name: '', unit: 'g', cost: 0, minStock: 0, moq: 0, supplier: '', storageArea: 'Dry Storage', forms: [] });
     setNewUnitName(''); setNewUnitRatio('');
   };
 
@@ -413,6 +417,14 @@ function IngredientsManager({ user, role, appId }) {
               <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Cost per {formData.unit || 'Unit'}</label>
               <div className="relative"><span className="absolute left-4 top-4 text-slate-400 font-bold">$</span><input type="number" step="0.0001" className="w-full border-2 border-slate-100 bg-slate-50 p-4 pl-8 rounded-xl font-mono font-bold" value={formData.cost} onChange={e => setFormData({...formData, cost: e.target.value})} placeholder="0.00" /></div>
             </div>
+            <div>
+              <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Alert Low Stock</label>
+              <input type="number" className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold" value={formData.minStock} onChange={e => setFormData({...formData, minStock: e.target.value})} placeholder="0" />
+            </div>
+            <div>
+              <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">MOQ (Order Qty)</label>
+              <input type="number" className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold" value={formData.moq} onChange={e => setFormData({...formData, moq: e.target.value})} placeholder="0" />
+            </div>
              <div className="col-span-2">
               <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Supplier</label>
               <input className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold" value={formData.supplier} onChange={e => setFormData({...formData, supplier: e.target.value})} />
@@ -445,7 +457,7 @@ function IngredientsManager({ user, role, appId }) {
              <button onClick={() => setViewMode('grid')} className={`p-2 rounded-lg transition ${viewMode === 'grid' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><Grid size={18}/></button>
              <button onClick={() => setViewMode('list')} className={`p-2 rounded-lg transition ${viewMode === 'list' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><ListIcon size={18}/></button>
           </div>
-          {role === 'admin' && <button onClick={() => { setEditingId(null); setFormData({ name: '', unit: 'g', cost: 0, supplier: '', storageArea: 'Dry Storage', forms: [] }); setIsAdding(true); }} className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-xl hover:bg-slate-800 shadow-lg transition font-bold text-sm h-10"><Plus size={18} /> Add</button>}
+          {role === 'admin' && <button onClick={() => { setEditingId(null); setFormData({ name: '', unit: 'g', cost: 0, minStock: 0, moq: 0, supplier: '', storageArea: 'Dry Storage', forms: [] }); setIsAdding(true); }} className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-xl hover:bg-slate-800 shadow-lg transition font-bold text-sm h-10"><Plus size={18} /> Add</button>}
         </div>
       </div>
 
@@ -469,7 +481,10 @@ function IngredientsManager({ user, role, appId }) {
                     )}
                  </div>
                </div>
-               <div className="flex justify-between items-center pl-2 pt-4 border-t border-slate-50"><span className="text-xs font-bold text-slate-400">Cost: <span className="text-slate-700 font-mono">${Number(ing.cost || 0).toFixed(2)}</span>/{ing.unit}</span></div>
+               <div className="flex justify-between items-center pl-2 pt-4 border-t border-slate-50">
+                 <span className="text-xs font-bold text-slate-400">Cost: <span className="text-slate-700 font-mono">${Number(ing.cost || 0).toFixed(2)}</span>/{ing.unit}</span>
+                 <span className="text-[10px] font-bold text-slate-400 bg-slate-50 px-2 py-1 rounded">MOQ: {ing.moq || 0}</span>
+               </div>
              </div>
            ))}
         </div>
@@ -477,13 +492,14 @@ function IngredientsManager({ user, role, appId }) {
         <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm min-w-[600px]">
-              <thead className="bg-slate-50 text-slate-400 uppercase font-black text-xs"><tr><th className="p-4">Name</th><th className="p-4">Area</th><th className="p-4 text-right">Stock</th><th className="p-4 text-right">Cost</th><th className="p-4 text-right">Actions</th></tr></thead>
+              <thead className="bg-slate-50 text-slate-400 uppercase font-black text-xs"><tr><th className="p-4">Name</th><th className="p-4">Area</th><th className="p-4 text-right">Stock</th><th className="p-4 text-right">MOQ</th><th className="p-4 text-right">Cost</th><th className="p-4 text-right">Actions</th></tr></thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredIngredients.map(ing => (
                   <tr key={ing.id} className="hover:bg-slate-50/50">
                     <td className="p-4 font-bold text-slate-800">{ing.name}</td>
                     <td className="p-4"><span className="text-[10px] font-black uppercase bg-slate-100 text-slate-500 px-2 py-1 rounded">{ing.storageArea}</span></td>
                     <td className="p-4 text-right font-black">{Math.round(ing.currentStock)} <span className="text-slate-400 text-xs">{ing.unit}</span></td>
+                    <td className="p-4 text-right text-slate-600 font-medium">{ing.moq || '-'}</td>
                     <td className="p-4 text-right font-mono">${Number(ing.cost).toFixed(2)}</td>
                     <td className="p-4 text-right flex justify-end gap-3">
                       {role === 'admin' && <><button onClick={() => setConfirmDelete(ing.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => startEdit(ing)} className="text-blue-600 font-bold hover:underline">Edit</button></>}
