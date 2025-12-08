@@ -395,7 +395,14 @@ function IngredientsManager({ user, role, appId }) {
             <div>
               <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Storage Area</label>
               <select className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold text-slate-700" value={formData.storageArea} onChange={e => setFormData({...formData, storageArea: e.target.value})}>
-                <option>Dry Storage</option><option>Fridge</option><option>Freezer</option><option>Bar</option>
+                <option>Dry Storage</option>
+                <option>Front Fridge</option>
+                <option>Back Fridge</option>
+                <option>Freezer 1</option>
+                <option>Freezer 2</option>
+                <option>Almari</option>
+                <option>Veg and Fruits</option>
+                <option>Bar</option>
               </select>
             </div>
             <div>
@@ -763,17 +770,7 @@ function StockTake({ user, role, appId }) {
   const [ingredients, setIngredients] = useState([]); const [grouped, setGrouped] = useState({}); const [counts, setCounts] = useState({}); const [activeTab, setActiveTab] = useState('Dry Storage'); const [isReviewing, setIsReviewing] = useState(false); const [showPin, setShowPin] = useState(false);
   useEffect(() => { return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => { const d = s.docs.map(doc => ({id: doc.id, ...doc.data()})); setIngredients(d); const g = {}; d.forEach(i => { if (!g[i.storageArea]) g[i.storageArea] = []; g[i.storageArea].push(i); }); setGrouped(g); if(Object.keys(g).length > 0 && !activeTab) setActiveTab(Object.keys(g)[0]); }); }, [appId, activeTab]);
   const handleCountChange = (ingId, type, val) => { setCounts(prev => ({ ...prev, [ingId]: { ...prev[ingId], [type]: parseFloat(val) || 0 } })); };
-  
-  // FIX: Added optional chaining and Array check to prevent crash if 'forms' is corrupted in DB
-  const calculateTotal = (ing) => { 
-    const c = counts[ing.id] || {}; 
-    let total = c.base || 0; 
-    if (Array.isArray(ing.forms)) { 
-        ing.forms.forEach((f, idx) => { total += (c[`form_${idx}`] || 0) * (f.ratio || 0); }); 
-    } 
-    return total; 
-  };
-
+  const calculateTotal = (ing) => { const c = counts[ing.id] || {}; let total = c.base || 0; if (ing.forms) { ing.forms.forEach((f, idx) => { total += (c[`form_${idx}`] || 0) * f.ratio; }); } return total; };
   const submitCount = async () => { await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'), { submittedBy: user.uid, timestamp: serverTimestamp(), status: 'pending', items: ingredients.map(ing => ({ id: ing.id, name: ing.name, currentSystemStock: ing.currentStock, countedStock: calculateTotal(ing), unit: ing.unit })) }); setCounts({}); alert("Submitted to Admin."); };
   if (role === 'admin' && isReviewing) return <AdminStockReview appId={appId} onClose={() => setIsReviewing(false)} />;
   return (
@@ -781,7 +778,7 @@ function StockTake({ user, role, appId }) {
       <PinModal isOpen={showPin} onClose={() => setShowPin(false)} onSuccess={submitCount} appId={appId} title="Admin PIN Required" />
       <div className="flex justify-between items-center mb-8"><div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Stock Take</h2><p className="text-slate-400 font-medium">Weekly Audit</p></div>{role === 'admin' && <button onClick={() => setIsReviewing(true)} className="bg-red-50 text-red-900 px-5 py-2.5 rounded-xl hover:bg-red-100 shadow-sm text-sm font-bold border border-red-200">Review Pending Counts</button>}</div>
       <div className="flex gap-2 overflow-x-auto pb-4 mb-2 scrollbar-hide">{Object.keys(grouped).map(area => (<button key={area} onClick={() => setActiveTab(area)} className={`px-6 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${activeTab === area ? 'bg-slate-900 text-white shadow-lg scale-105' : 'bg-white text-slate-500 border border-slate-200 hover:border-slate-300'}`}>{area}</button>))}</div>
-      <div className="bg-white rounded-3xl shadow-sm border border-slate-100 divide-y divide-slate-100">{grouped[activeTab]?.map(ing => (<div key={ing.id} className="p-6 hover:bg-slate-50 transition"><div className="flex justify-between mb-4 items-center"><span className="font-bold text-lg text-slate-800">{ing.name}</span><span className="text-sm font-black text-blue-600 bg-blue-50 border border-blue-100 px-3 py-1.5 rounded-lg tracking-wide shadow-sm">System Stock: {Math.round(ing.currentStock)} {ing.unit}</span></div><div className="flex flex-wrap gap-6 items-end">{Array.isArray(ing.forms) && ing.forms.map((f, idx) => (<div key={idx} className="flex flex-col"><label className="text-[10px] font-black text-red-900 mb-2 uppercase tracking-wide">{f.name}</label><input type="number" min="0" className="border border-red-100 bg-red-50 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-red-900 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, `form_${idx}`, e.target.value)} /></div>))}<div className="flex flex-col"><label className="text-[10px] font-black text-slate-400 mb-2 uppercase tracking-wide">Loose ({ing.unit})</label><input type="number" min="0" className="border border-slate-200 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-slate-400 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, 'base', e.target.value)} /></div><div className="ml-auto text-right"><span className="text-[10px] text-slate-400 block font-black uppercase tracking-wide">Counted Total</span><span className="font-black text-2xl text-slate-900">{calculateTotal(ing)} <span className="text-sm font-bold text-slate-400">{ing.unit}</span></span></div></div></div>))}</div>
+      <div className="bg-white rounded-3xl shadow-sm border border-slate-100 divide-y divide-slate-100">{grouped[activeTab]?.map(ing => (<div key={ing.id} className="p-6 hover:bg-slate-50 transition"><div className="flex justify-between mb-4 items-center"><span className="font-bold text-lg text-slate-800">{ing.name}</span><span className="text-sm font-black text-blue-600 bg-blue-50 border border-blue-100 px-3 py-1.5 rounded-lg tracking-wide shadow-sm">System Stock: {Math.round(ing.currentStock)} {ing.unit}</span></div><div className="flex flex-wrap gap-6 items-end">{ing.forms?.map((f, idx) => (<div key={idx} className="flex flex-col"><label className="text-[10px] font-black text-red-900 mb-2 uppercase tracking-wide">{f.name}</label><input type="number" min="0" className="border border-red-100 bg-red-50 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-red-900 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, `form_${idx}`, e.target.value)} /></div>))}<div className="flex flex-col"><label className="text-[10px] font-black text-slate-400 mb-2 uppercase tracking-wide">Loose ({ing.unit})</label><input type="number" min="0" className="border border-slate-200 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-slate-400 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, 'base', e.target.value)} /></div><div className="ml-auto text-right"><span className="text-[10px] text-slate-400 block font-black uppercase tracking-wide">Counted Total</span><span className="font-black text-2xl text-slate-900">{calculateTotal(ing)} <span className="text-sm font-bold text-slate-400">{ing.unit}</span></span></div></div></div>))}</div>
       <div className="fixed bottom-0 left-0 w-full bg-white/80 backdrop-blur-md border-t border-slate-200 p-4 md:pl-80 flex justify-end z-10 shadow-lg"><button onClick={() => setShowPin(true)} className="bg-slate-900 text-white font-bold py-3 px-10 rounded-xl shadow-xl hover:bg-slate-800 transition transform hover:-translate-y-1">Submit Count</button></div>
     </div>
   );
