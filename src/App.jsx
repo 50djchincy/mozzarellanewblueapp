@@ -3,7 +3,7 @@ import { initializeApp } from 'firebase/app';
 import { 
   getFirestore, collection, addDoc, updateDoc, doc, 
   onSnapshot, query, orderBy, serverTimestamp, 
-  setDoc, getDoc, writeBatch, increment, deleteDoc, where, Timestamp, getDocs
+  setDoc, getDoc, writeBatch, increment, deleteDoc, where, Timestamp, getDocs, limit
 } from 'firebase/firestore';
 import { 
   getAuth, signInAnonymously, onAuthStateChanged 
@@ -14,7 +14,7 @@ import {
   Save, AlertCircle, Search, ArrowRight, CheckCircle, 
   XCircle, Truck, Info, Settings, Lock, DollarSign, Edit2,
   Grid, List as ListIcon, X, PieChart, Menu, Calendar,
-  Printer, Share2, TrendingUp, Filter, ChevronDown, AlertTriangle, Copy, Tag
+  Printer, Share2, TrendingUp, Filter, ChevronDown, AlertTriangle, Copy, Tag, Sparkles
 } from 'lucide-react';
 
 // --- Firebase Configuration ---
@@ -31,6 +31,59 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = "mystockrestnewblue"; 
+const GEMINI_API_KEY = ""; // Canvas will automatically provide this
+
+// --- LLM API Helper Functions ---
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
+
+async function callGemini(systemInstruction, userQuery, isJson = false) {
+    const payload = {
+        contents: [{ parts: [{ text: userQuery }] }],
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        config: isJson ? { responseMimeType: "application/json" } : {}
+    };
+
+    let attempts = 0;
+    const maxAttempts = 3;
+    while (attempts < maxAttempts) {
+        try {
+            const response = await fetch(GEMINI_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                if (response.status === 429 && attempts < maxAttempts - 1) {
+                    const delay = Math.pow(2, attempts) * 1000;
+                    console.warn(`Rate limit hit. Retrying in ${delay / 1000}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    attempts++;
+                    continue; 
+                }
+                throw new Error(`API call failed with status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            
+            if (isJson) {
+                try {
+                    return JSON.parse(text);
+                } catch (e) {
+                    console.error("Failed to parse JSON from LLM:", text, e);
+                    return { error: "Failed to parse JSON response." };
+                }
+            }
+            return text;
+
+        } catch (error) {
+            console.error("Gemini API error:", error);
+            return { error: `Gemini API failed: ${error.message}` };
+        }
+    }
+    return { error: "Gemini API failed after multiple retries." };
+}
 
 // --- Branding Component ---
 const MozzarellaLogo = ({ 
@@ -176,10 +229,10 @@ export default function InventoryApp() {
           <NavItem icon={ClipboardCheck} label="Stock Take" view="stocktake" current={view} setView={setView} />
           <NavItem icon={History} label="Reports & Orders" view="reports" current={view} setView={setView} />
           {role === 'admin' && (
-             <>
-               <div className="px-4 py-3 mt-6 text-[10px] font-black text-red-900/50 uppercase tracking-widest border-t border-slate-50">Admin</div>
-               <NavItem icon={Settings} label="Settings" view="settings" current={view} setView={setView} />
-             </>
+              <>
+                <div className="px-4 py-3 mt-6 text-[10px] font-black text-red-900/50 uppercase tracking-widest border-t border-slate-50">Admin</div>
+                <NavItem icon={Settings} label="Settings" view="settings" current={view} setView={setView} />
+              </>
           )}
         </nav>
         <div className="p-4 border-t border-slate-100">
@@ -229,6 +282,9 @@ function Reports({ user, role, appId }) {
   const [logs, setLogs] = useState([]);
   const [ingredients, setIngredients] = useState([]);
   const [menuItems, setMenuItems] = useState([]);
+  const [varianceReports, setVarianceReports] = useState([]);
+  const [orderSummary, setOrderSummary] = useState(null); // LLM Result
+  const [summaryLoading, setSummaryLoading] = useState(false);
   
   const [dateRange, setDateRange] = useState('all'); 
   const [customStart, setCustomStart] = useState('');
@@ -238,7 +294,10 @@ function Reports({ user, role, appId }) {
     const unsubLogs = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'logs'), orderBy('timestamp', 'desc')), (s) => setLogs(s.docs.map(d => ({id:d.id, ...d.data()}))));
     const unsubIng = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => setIngredients(s.docs.map(d => ({id:d.id, ...d.data()}))));
     const unsubMenu = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'menu_items'), (s) => setMenuItems(s.docs.map(d => ({id:d.id, ...d.data()}))));
-    return () => { unsubLogs(); unsubIng(); unsubMenu(); };
+    // Fetch variance reports
+    const unsubVar = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'variance_reports'), orderBy('timestamp', 'desc'), limit(20)), (s) => setVarianceReports(s.docs.map(d => ({id:d.id, ...d.data()}))));
+    
+    return () => { unsubLogs(); unsubIng(); unsubMenu(); unsubVar(); };
   }, [appId]);
 
   const filteredLogs = useMemo(() => {
@@ -259,6 +318,29 @@ function Reports({ user, role, appId }) {
   const lowStockItems = ingredients.filter(i => (i.currentStock || 0) <= (i.minStock || 0));
   const groupedOrders = lowStockItems.reduce((acc, item) => { const supp = item.supplier || 'Unassigned'; if (!acc[supp]) acc[supp] = []; acc[supp].push(item); return acc; }, {});
 
+  // --- LLM: Order Sheet Analysis ---
+  const generateOrderSummary = async () => {
+    setSummaryLoading(true);
+    setOrderSummary(null);
+    
+    const lowStockList = Object.entries(groupedOrders).map(([supplier, items]) => {
+        const itemDetails = items.map(ing => {
+            const deficit = (ing.minStock || 0) - (ing.currentStock || 0);
+            return `${ing.name} (Need: ${Math.round(deficit * 100)/100} ${ing.unit}, Cost: $${ing.cost.toFixed(2)}/${ing.unit})`;
+        }).join('; ');
+        return `Supplier ${supplier}: ${itemDetails}`;
+    }).join('\n');
+    
+    const prompt = `Analyze the following procurement list for a restaurant kitchen. Provide a concise summary of the key needs and offer 2-3 strategic purchasing recommendations (e.g., focus on high-cost items, group bulk buys, look for substitutions). The list is:\n\n${lowStockList}`;
+    
+    const systemPrompt = "You are a senior supply chain consultant specializing in restaurant operations. Your tone should be professional and strategic. Respond using clear paragraphs.";
+    
+    const result = await callGemini(systemPrompt, prompt);
+    setOrderSummary(result.error ? `Error: ${result.error}` : result);
+    setSummaryLoading(false);
+  };
+
+
   // --- Share Logic ---
   const handleShare = async () => {
     let text = `*Order Sheet - ${new Date().toLocaleDateString()}*\n\n`;
@@ -266,7 +348,6 @@ function Reports({ user, role, appId }) {
         text += `*${supplier}*\n`;
         items.forEach(ing => {
             const deficit = (ing.minStock || 0) - (ing.currentStock || 0);
-            // Removed MOQ logic, just use deficit
             const qty = deficit; 
             text += `- ${ing.name}: ${Math.round(qty * 100)/100} ${ing.unit}\n`;
         });
@@ -289,12 +370,13 @@ function Reports({ user, role, appId }) {
   return (
     <div className="max-w-6xl mx-auto space-y-6">
        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-          <div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Reports & Orders</h2><p className="text-slate-400 font-medium">Business Intelligence Center</p></div>
-          <div className="flex bg-white rounded-xl border border-slate-200 p-1 shadow-sm overflow-x-auto max-w-full">
-            <button onClick={() => setTab('insights')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'insights' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Insights</button>
-            <button onClick={() => setTab('orders')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap flex items-center gap-2 ${tab === 'orders' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Order Sheet {lowStockItems.length > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{lowStockItems.length}</span>}</button>
-            <button onClick={() => setTab('logs')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'logs' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Activity Log</button>
-          </div>
+         <div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Reports & Orders</h2><p className="text-slate-400 font-medium">Business Intelligence Center</p></div>
+         <div className="flex bg-white rounded-xl border border-slate-200 p-1 shadow-sm overflow-x-auto max-w-full">
+           <button onClick={() => setTab('insights')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'insights' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Insights</button>
+           <button onClick={() => setTab('orders')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap flex items-center gap-2 ${tab === 'orders' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Order Sheet {lowStockItems.length > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{lowStockItems.length}</span>}</button>
+           <button onClick={() => setTab('logs')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'logs' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Activity Log</button>
+           <button onClick={() => setTab('history')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'history' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>History & Variance</button>
+         </div>
        </div>
 
        {tab === 'insights' && (
@@ -331,10 +413,21 @@ function Reports({ user, role, appId }) {
               <div className="bg-slate-900 text-white p-6 rounded-3xl mb-6 flex flex-col md:flex-row justify-between items-center shadow-xl">
                   <div><h3 className="text-2xl font-black">Procurement Sheet</h3><p className="text-slate-400 text-sm mt-1">Items below Par Level grouped by Supplier</p></div>
                   <div className="flex gap-2 mt-4 md:mt-0">
+                      <button onClick={generateOrderSummary} disabled={summaryLoading} className="bg-purple-600 text-white px-5 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-purple-700 transition shadow-lg text-sm disabled:opacity-50">
+                        {summaryLoading ? 'Analyzing...' : <><Sparkles size={16} /> Analyze Order</>}
+                      </button>
                       <button onClick={() => window.print()} className="bg-white text-slate-900 px-5 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-slate-100 transition shadow-lg text-sm"><Printer size={16} /> Print / Save PDF</button>
                       <button onClick={handleShare} className="bg-blue-600 text-white px-5 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-blue-700 transition shadow-lg text-sm"><Share2 size={16} /> Share List</button>
                   </div>
               </div>
+
+              {orderSummary && (
+                <div className="bg-white p-6 rounded-2xl shadow-md mb-6 border border-purple-200 animate-in fade-in">
+                    <h4 className="font-black text-purple-700 text-lg mb-2 flex items-center gap-2"><Sparkles size={18}/> Optimization Analysis</h4>
+                    <div className="text-sm text-slate-700 whitespace-pre-wrap">{orderSummary}</div>
+                </div>
+              )}
+
               {Object.keys(groupedOrders).length === 0 ? (
                   <div className="bg-white p-12 rounded-3xl border border-dashed border-slate-300 text-center"><CheckCircle className="mx-auto text-green-500 mb-4" size={48} /><h3 className="text-xl font-black text-slate-800">All Stocked Up!</h3><p className="text-slate-500 font-medium mt-2">No items are currently below their minimum stock level.</p></div>
               ) : (
@@ -354,6 +447,42 @@ function Reports({ user, role, appId }) {
          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in slide-in-from-bottom-4">
             <div className="p-6 border-b border-slate-100"><h3 className="font-black text-slate-800">Full System Log</h3></div>
             <ul className="divide-y divide-slate-100">{logs.map((l, i) => (<li key={i} className="p-4 text-sm hover:bg-slate-50 transition"><span className="text-[10px] font-bold text-slate-400 block mb-1 uppercase tracking-wide">{l.timestamp?.toDate().toLocaleString()}</span><span className="font-medium text-slate-800">{l.message}</span></li>))}</ul>
+         </div>
+       )}
+
+       {tab === 'history' && (
+         <div className="space-y-4 animate-in fade-in">
+            <h3 className="font-black text-slate-800 text-lg">Inventory Events History</h3>
+            {varianceReports.length === 0 ? <div className="p-8 text-center text-slate-400">No history reports generated yet.</div> : 
+             varianceReports.map(rep => (
+                <div key={rep.id} className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                    <div className="bg-slate-50 p-4 border-b border-slate-100 flex justify-between items-center">
+                        <div>
+                            <span className={`text-[10px] font-black uppercase px-2 py-1 rounded tracking-wide ${rep.type === 'stock_take' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'}`}>{rep.title}</span>
+                            <span className="text-xs text-slate-400 font-bold ml-2">{rep.timestamp?.toDate().toLocaleString()}</span>
+                        </div>
+                    </div>
+                    <div className="max-h-60 overflow-y-auto">
+                        <table className="w-full text-xs text-left">
+                            <thead className="bg-white text-slate-400 border-b border-slate-50">
+                                <tr><th className="p-3">Item</th><th className="p-3 text-right">Change / Variance</th></tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-50">
+                                {rep.items?.map((item, i) => (
+                                    <tr key={i}>
+                                        <td className="p-3 font-medium text-slate-700">{item.name}</td>
+                                        <td className={`p-3 text-right font-bold ${item.variance < 0 || item.change < 0 ? 'text-red-500' : 'text-green-500'}`}>
+                                            {item.variance ? (item.variance > 0 ? `+${item.variance}` : item.variance) : item.change} 
+                                            <span className="text-[10px] text-slate-300 font-normal ml-1">{item.unit}</span>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+             ))
+            }
          </div>
        )}
     </div>
@@ -448,6 +577,7 @@ function IngredientsManager({ user, role, appId }) {
   const [search, setSearch] = useState('');
   const [viewMode, setViewMode] = useState('grid');
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [sortBy, setSortBy] = useState('name');
 
   // State for Preps
   const [isAddingPrep, setIsAddingPrep] = useState(false);
@@ -485,10 +615,12 @@ function IngredientsManager({ user, role, appId }) {
   }, [user, appId]);
 
   // --- Logic for Ingredients ---
-  const filteredIngredients = ingredients.filter(i => 
-    i.name.toLowerCase().includes(search.toLowerCase()) || 
-    i.supplier?.toLowerCase().includes(search.toLowerCase())
-  );
+  const filteredIngredients = ingredients
+      .filter(i => i.name.toLowerCase().includes(search.toLowerCase()) || i.supplier?.toLowerCase().includes(search.toLowerCase()))
+      .sort((a,b) => {
+          if (sortBy === 'supplier') return (a.supplier || '').localeCompare(b.supplier || '');
+          return a.name.localeCompare(b.name);
+      });
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -698,6 +830,10 @@ function IngredientsManager({ user, role, appId }) {
         <>
             <div className="flex flex-wrap gap-2 items-center mb-6">
                 <div className="relative w-full md:w-auto"><Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"/><input className="pl-10 pr-4 py-2 rounded-xl border border-slate-200 text-sm font-bold bg-white focus:outline-none focus:border-red-900 w-full md:w-64" placeholder="Search ingredients..." value={search} onChange={e => setSearch(e.target.value)} /></div>
+                <div className="flex bg-white rounded-xl border border-slate-200 p-1 text-xs font-bold">
+                    <button onClick={() => setSortBy('name')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'name' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>A-Z</button>
+                    <button onClick={() => setSortBy('supplier')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'supplier' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>Supplier</button>
+                </div>
                 <div className="flex bg-white rounded-xl border border-slate-200 p-1">
                     <button onClick={() => setViewMode('grid')} className={`p-2 rounded-lg transition ${viewMode === 'grid' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><Grid size={18}/></button>
                     <button onClick={() => setViewMode('list')} className={`p-2 rounded-lg transition ${viewMode === 'list' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><ListIcon size={18}/></button>
@@ -727,6 +863,7 @@ function IngredientsManager({ user, role, appId }) {
                     </div>
                     <div className="flex justify-between items-center pl-2 pt-4 border-t border-slate-50">
                         <span className="text-xs font-bold text-slate-400">Cost: <span className="text-slate-700 font-mono">${Number(ing.cost || 0).toFixed(2)}</span>/{ing.unit}</span>
+                        {ing.supplier && <span className="text-xs font-bold text-slate-400 bg-slate-50 px-2 py-1 rounded">{ing.supplier}</span>}
                     </div>
                     </div>
                 ))}
@@ -810,6 +947,10 @@ function MenuManager({ user, role, appId }) {
   const [viewMode, setViewMode] = useState('list');
   const [confirmDelete, setConfirmDelete] = useState(null);
   
+  // LLM State
+  const [optimizationLoading, setOptimizationLoading] = useState(false);
+  const [optimizationResult, setOptimizationResult] = useState(null);
+
   // Selection States
   const [selectedIngId, setSelectedIngId] = useState(''); 
   const [selectedQty, setSelectedQty] = useState('');
@@ -837,6 +978,7 @@ function MenuManager({ user, role, appId }) {
       else { await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'menu_items'), data); }
       // Reset form with category default
       setIsAdding(false); setEditingItem(null); setFormData({ name: '', category: 'Mains', type: 'recipe', recipe: [], otherCost: 0, linkedIngredientId: '' });
+      setOptimizationResult(null); // Clear optimization result on save
     } catch (err) { alert("Error saving item"); }
   };
 
@@ -869,16 +1011,66 @@ function MenuManager({ user, role, appId }) {
   const currentRecipeCost = useMemo(() => {
      let c = 0; formData.recipe.forEach(r => { const ing = ingredients.find(i => i.id === r.ingredientId); if (ing) c += (ing.cost || 0) * r.qty; }); return c;
   }, [formData.recipe, ingredients]);
+  
+  // --- LLM: Recipe Cost Optimizer ---
+  const optimizeRecipe = async () => {
+    if (formData.recipe.length === 0) return alert("Please add ingredients first.");
+    setOptimizationLoading(true);
+    setOptimizationResult(null);
 
+    const recipeDetails = formData.recipe.map(r => {
+        const ing = ingredients.find(i => i.id === r.ingredientId);
+        const cost = ing ? (ing.cost * r.qty) : 0;
+        return { 
+            name: r.ingredientName, 
+            quantity: `${r.qty}`, 
+            unit: ing.unit, 
+            unit_cost: ing.cost, 
+            total_cost: cost.toFixed(2) 
+        };
+    });
+    
+    const prompt = `Analyze the recipe for "${formData.name}" (Total Cost: $${currentRecipeCost.toFixed(2)}). Identify the highest-costing ingredient(s) and provide two realistic, specific cost-saving suggestions for a restaurant kitchen. The current ingredients are: ${JSON.stringify(recipeDetails)}.`;
+    
+    const systemPrompt = "You are a professional Food Cost Analyst. Respond with a JSON object containing the suggested changes and analysis.";
+    
+    const schema = {
+        type: "OBJECT",
+        properties: {
+            analysis: { type: "STRING", description: "A one-sentence summary of the cost driver." },
+            suggestions: {
+                type: "ARRAY",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        ingredient: { type: "STRING", description: "The ingredient to change." },
+                        action: { type: "STRING", description: "The specific action (e.g., 'Reduce quantity by 20%', 'Substitute with x')." },
+                        estimated_saving: { type: "STRING", description: "Estimated cost saving as a percentage or dollar amount." }
+                    }
+                }
+            }
+        }
+    };
+    
+    const result = await callGemini(systemPrompt, prompt, true, schema);
+
+    if (result.error) {
+         setOptimizationResult({ error: `LLM Error: ${result.error}` });
+    } else {
+        setOptimizationResult(result);
+    }
+    setOptimizationLoading(false);
+  };
+  
   if (isAdding) {
     return (
-      <div className="bg-white p-4 md:p-8 rounded-3xl shadow-2xl max-w-2xl mx-auto border border-slate-100 animate-in zoom-in-95">
+      <div className="bg-white p-4 md:p-8 rounded-3xl shadow-2xl max-w-3xl mx-auto border border-slate-100 animate-in zoom-in-95">
         <h3 className="text-2xl font-black text-slate-900 mb-6">{editingItem ? 'Edit' : 'Add'} Menu Item</h3>
         <form onSubmit={handleSubmit} className="space-y-6">
            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
              <div className="md:col-span-1">
                <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">POS Item Name</label>
-               <input required className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl focus:border-red-900 focus:bg-white outline-none font-bold" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} placeholder="e.g. Margarita Pizza" />
+               <input required className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl focus:border-red-900 focus:bg-white outline-none font-bold" value={formData.name} onChange={e => {setFormData({...formData, name: e.target.value}); setOptimizationResult(null); }} placeholder="e.g. Margarita Pizza" />
              </div>
              <div className="md:col-span-1">
                <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Category</label>
@@ -911,14 +1103,48 @@ function MenuManager({ user, role, appId }) {
                      <button type="button" onClick={addIngredientToRecipe} className="w-full md:w-auto bg-slate-900 text-white px-5 py-3 rounded-xl text-sm font-bold hover:bg-slate-800 shadow-md h-[44px]">Add</button>
                   </div>
                   <ul className="space-y-2 mb-4">{formData.recipe.map((r, i) => { const ing = ingredients.find(inG => inG.id === r.ingredientId); const cost = ing ? (ing.cost * r.qty).toFixed(2) : '0.00'; return (<li key={i} className="flex justify-between items-center text-sm bg-white p-3 rounded-xl border border-red-100 shadow-sm"><span className="font-bold text-slate-700">{r.qty} {ing?.unit} {r.ingredientName}</span><div className="flex items-center gap-3"><span className="text-slate-400 font-mono text-xs font-bold">${cost}</span><button type="button" onClick={() => setFormData(prev => ({...prev, recipe: prev.recipe.filter((_, idx) => idx !== i)}))} className="text-red-400 hover:text-red-600"><Trash2 size={16}/></button></div></li>); })}</ul>
-                  <div className="text-right border-t border-red-200 pt-3"><span className="text-xs text-red-800 font-bold uppercase mr-2">Ingredients Total:</span><span className="font-mono font-bold text-slate-900 text-lg">${currentRecipeCost.toFixed(2)}</span></div>
+                  <div className="text-right border-t border-red-200 pt-3 flex justify-between items-center">
+                    <button type="button" onClick={optimizeRecipe} disabled={optimizationLoading} className="bg-purple-600 text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-purple-700 transition disabled:opacity-50 flex items-center gap-1">
+                        {optimizationLoading ? 'Analyzing...' : <><Sparkles size={14} /> Optimize Cost</>}
+                    </button>
+                    <div>
+                        <span className="text-xs text-red-800 font-bold uppercase mr-2">Ingredients Total:</span>
+                        <span className="font-mono font-bold text-slate-900 text-lg">${currentRecipeCost.toFixed(2)}</span>
+                    </div>
+                  </div>
                </div>
+               
+               {/* LLM Optimization Result Display */}
+               {optimizationResult && (
+                    <div className={`p-4 rounded-xl border ${optimizationResult.error ? 'bg-red-50 border-red-200' : 'bg-purple-50 border-purple-200'} animate-in fade-in`}>
+                        <h5 className="font-black text-sm text-purple-900 mb-2">{optimizationResult.error ? 'LLM Error' : 'Optimization Suggestions'}</h5>
+                        {optimizationResult.error ? (
+                            <p className="text-xs text-red-800">{optimizationResult.error}</p>
+                        ) : (
+                            <div className="space-y-3">
+                                <p className="text-sm font-medium text-purple-900">{optimizationResult.analysis}</p>
+                                <ul className="space-y-1 text-sm">
+                                    {optimizationResult.suggestions?.map((s, i) => (
+                                        <li key={i} className="flex gap-2 text-slate-700">
+                                            <span className="font-black text-purple-600">→</span>
+                                            <div className="flex-1">
+                                                <span className="font-bold">{s.ingredient}:</span> {s.action} 
+                                                <span className="text-xs font-mono ml-2 text-green-700 bg-green-100 px-1 rounded">{s.estimated_saving}</span>
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+                    </div>
+               )}
+
              </div>
            )}
            {formData.type === 'stock_item' && (<div className="bg-red-50 p-6 rounded-2xl border border-red-100 animate-in fade-in"><h4 className="font-black text-sm text-red-900 mb-2 uppercase tracking-wide">Link to Inventory</h4><select value={formData.linkedIngredientId} onChange={(e) => setFormData({...formData, linkedIngredientId: e.target.value})} className="w-full border-0 text-sm p-4 rounded-xl bg-white shadow-sm ring-1 ring-slate-200 font-bold text-slate-800"><option value="">Select Stock Item...</option>{ingredients.map(i => <option key={i.id} value={i.id}>{i.name} ({i.unit})</option>)}</select></div>)}
            {formData.type !== 'non_stock' && (<div><label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Other Costs</label><div className="relative"><span className="absolute left-4 top-4 text-slate-400 font-bold">$</span><input type="number" step="0.01" className="w-full border-2 border-slate-100 bg-slate-50 p-4 pl-8 rounded-xl font-mono font-bold text-slate-800" value={formData.otherCost} onChange={e => setFormData({...formData, otherCost: e.target.value})} placeholder="0.00" /></div></div>)}
            {formData.type !== 'non_stock' && (<div className="bg-slate-900 text-white p-6 rounded-2xl flex justify-between items-center shadow-lg"><span className="font-black text-sm uppercase tracking-wide text-slate-400">Total Cost</span><span className="font-mono text-3xl font-black text-white">${(formData.type === 'recipe' ? (currentRecipeCost + (parseFloat(formData.otherCost) || 0)) : ((ingredients.find(i => i.id === formData.linkedIngredientId)?.cost || 0) + (parseFloat(formData.otherCost) || 0))).toFixed(2)}</span></div>)}
-           <div className="flex gap-4 justify-end pt-8 border-t border-slate-100"><button type="button" onClick={() => { setIsAdding(false); setEditingItem(null); }} className="px-6 py-3 text-slate-500 font-bold hover:text-slate-800">Cancel</button><button type="submit" className="px-8 py-3 bg-red-900 text-white rounded-xl font-black hover:bg-red-950 shadow-lg transition transform hover:-translate-y-1">Save Item</button></div>
+           <div className="flex gap-4 justify-end pt-8 border-t border-slate-100"><button type="button" onClick={() => { setIsAdding(false); setEditingItem(null); setOptimizationResult(null); }} className="px-6 py-3 text-slate-500 font-bold hover:text-slate-800">Cancel</button><button type="submit" className="px-8 py-3 bg-red-900 text-white rounded-xl font-black hover:bg-red-950 shadow-lg transition transform hover:-translate-y-1">Save Item</button></div>
         </form>
       </div>
     );
@@ -955,7 +1181,7 @@ function MenuManager({ user, role, appId }) {
                       {item.type === 'non_stock' && <span className="text-slate-300">-</span>}
                     </td>
                     <td className="p-6 text-right font-mono font-black text-slate-900 text-lg">{item.type !== 'non_stock' ? `$${totalCost.toFixed(2)}` : '-'}</td>
-                    <td className="p-6 text-right flex justify-end gap-3">{role === 'admin' && <><button onClick={() => setConfirmDelete(item.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => { setFormData({...item, category: item.category || 'Mains'}); setEditingItem(item.id); setIsAdding(true); }} className="text-slate-500 hover:text-slate-900 text-sm font-bold bg-slate-100 hover:bg-red-100 px-4 py-2 rounded-lg transition">Edit</button></>}</td>
+                    <td className="p-6 text-right flex justify-end gap-3">{role === 'admin' && <><button onClick={() => setConfirmDelete(item.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => { setFormData({...item, category: item.category || 'Mains'}); setEditingItem(item.id); setIsAdding(true); setOptimizationResult(null); }} className="text-slate-500 hover:text-slate-900 text-sm font-bold bg-slate-100 hover:bg-red-100 px-4 py-2 rounded-lg transition">Edit</button></>}</td>
                   </tr>
                 )})}
               </tbody>
@@ -975,7 +1201,7 @@ function MenuManager({ user, role, appId }) {
                </div>
                <div className="mt-4 pt-4 border-t border-slate-50 flex justify-between items-end">
                   <span className="font-mono font-black text-2xl text-slate-900">{item.type !== 'non_stock' ? `$${totalCost.toFixed(2)}` : '-'}</span>
-                  {role === 'admin' && <div className="flex gap-2"><button onClick={() => setConfirmDelete(item.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => { setFormData({...item, category: item.category || 'Mains'}); setEditingItem(item.id); setIsAdding(true); }} className="text-blue-600 font-bold hover:underline text-xs">Edit</button></div>}
+                  {role === 'admin' && <div className="flex gap-2"><button onClick={() => setConfirmDelete(item.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => { setFormData({...item, category: item.category || 'Mains'}); setEditingItem(item.id); setIsAdding(true); setOptimizationResult(null); }} className="text-blue-600 font-bold hover:underline text-xs">Edit</button></div>}
                </div>
             </div>
           )})}
@@ -1094,34 +1320,51 @@ function CSVUploader({ user, role, appId }) {
   const applyStockChanges = async () => { 
     setStep('processing'); 
     const batch = writeBatch(db); 
-    let logMsg = "CSV Import:\n"; 
     
+    // Prepare Report Data
+    const reportItems = [];
+
     for (const row of matchedData) { 
         if (!row.found) continue; 
         
-        // 1. Update Sales Count for Best Sellers Report
+        // 1. Sales Count Update
         const itemRef = doc(db, 'artifacts', appId, 'public', 'data', 'menu_items', row.itemData.id);
         batch.update(itemRef, { soldCount: increment(row.qty) });
 
-        // 2. Update Stock
+        // 2. Stock Update
         if (row.itemData.type === 'recipe') { 
             const multiplier = row.qty; 
             for (const ing of row.itemData.recipe) { 
                 const ingRef = doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', ing.ingredientId); 
-                batch.update(ingRef, { currentStock: increment(- (ing.qty * multiplier)) }); 
+                const deductQty = ing.qty * multiplier;
+                batch.update(ingRef, { currentStock: increment(- deductQty) }); 
+                
+                // Add to report
+                reportItems.push({ name: `${row.name} (Ing: ${ing.ingredientName})`, change: -deductQty, unit: 'units' });
             } 
-            logMsg += `- Sold ${row.qty}x ${row.name}\n`; 
         } else if (row.itemData.type === 'stock_item' && row.itemData.linkedIngredientId) { 
             const ingRef = doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', row.itemData.linkedIngredientId); 
             batch.update(ingRef, { currentStock: increment(- row.qty) }); 
-            logMsg += `- Sold ${row.qty}x ${row.name}\n`; 
+            
+            // Add to report
+            reportItems.push({ name: row.name, change: -row.qty, unit: 'units' });
         } 
     } 
+
+    // 3. Create Sales Batch Report
+    const reportRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'variance_reports'));
+    batch.set(reportRef, {
+        timestamp: serverTimestamp(),
+        type: 'sales_upload',
+        title: 'POS Sales Import',
+        items: reportItems
+    });
+
     await addLog(db, appId, user.uid, "Processed CSV Sales"); 
     await batch.commit(); 
     setStep('upload'); 
     setMatchedData([]); 
-    alert("Stock updated!"); 
+    alert("Stock updated & Sales Report saved!"); 
   };
 
   return <div className="max-w-4xl mx-auto"><h2 className="text-3xl font-black text-slate-900 mb-8">Upload Daily Sales</h2>{step === 'upload' && <div className="bg-white p-12 rounded-3xl shadow-sm border-2 border-dashed border-slate-200 text-center hover:border-red-900 transition-colors group"><div className="bg-slate-50 w-24 h-24 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-red-50 transition"><FileSpreadsheet className="text-slate-400 group-hover:text-red-900 transition" size={40} /></div><p className="text-xl font-bold text-slate-800 mb-2">Upload POS CSV</p><label className="inline-block cursor-pointer"><span className="bg-slate-900 text-white px-8 py-4 rounded-2xl font-bold hover:bg-slate-800 transition shadow-lg hover:shadow-xl transform hover:-translate-y-1 block">Select CSV File</span><input type="file" accept=".csv" onChange={handleFileUpload} className="hidden" /></label></div>}{step === 'preview' && <div className="bg-white rounded-2xl shadow-lg overflow-hidden border border-slate-200"><div className="p-6 border-b border-slate-100 bg-slate-50 flex justify-between items-center"><h3 className="font-bold text-slate-800 text-lg">Preview & Match</h3><div className="space-x-3"><button onClick={() => setStep('upload')} className="px-5 py-2 text-sm font-bold text-slate-500 hover:text-slate-800">Cancel</button><button onClick={applyStockChanges} className="px-6 py-2 text-sm bg-green-600 text-white rounded-xl font-bold hover:bg-green-700 shadow-md">Confirm</button></div></div><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="bg-slate-100 text-slate-500 uppercase font-bold"><tr><th className="p-4">Qty</th><th className="p-4">Item Name</th><th className="p-4">Status</th><th className="p-4">Impact</th></tr></thead><tbody className="divide-y divide-slate-100">{matchedData.map((row, i) => (<tr key={i} className={!row.found ? 'bg-red-50' : 'hover:bg-slate-50'}><td className="p-4 font-mono font-bold text-slate-700">{row.qty}</td><td className="p-4 font-medium text-slate-800">{row.name}</td><td className="p-4">{row.found ? (row.itemData.type === 'non_stock' ? <span className="text-slate-400 font-bold text-[10px]">IGNORED</span> : <span className="text-green-600 font-bold text-[10px]">READY</span>) : <span className="text-red-500 font-bold text-[10px]">UNKNOWN</span>}</td><td className="p-4 text-xs text-slate-500">{row.found && row.itemData.type === 'recipe' && <span>Recipe Deduct</span>}{row.found && row.itemData.type === 'stock_item' && <span>Stock Deduct</span>}</td></tr>))}</tbody></table></div></div>}</div>;
@@ -1138,6 +1381,7 @@ function StockTake({ user, role, appId }) {
   const [activeTab, setActiveTab] = useState('Dry Storage'); 
   const [isReviewing, setIsReviewing] = useState(false); 
   const [showPin, setShowPin] = useState(false);
+  const [sortBy, setSortBy] = useState('name');
 
   useEffect(() => {
     // 1. Fetch Ingredients
@@ -1244,21 +1488,30 @@ function StockTake({ user, role, appId }) {
           {role === 'admin' && <button onClick={() => setIsReviewing(true)} className="bg-red-50 text-red-900 px-5 py-2.5 rounded-xl hover:bg-red-100 shadow-sm text-sm font-bold border border-red-200">Review Pending Counts</button>}
       </div>
       
-      <div className="flex gap-2 overflow-x-auto pb-4 mb-2 no-scrollbar [-webkit-overflow-scrolling:touch]">
-          {allAreas.map(area => (
-              <button key={area} onClick={() => setActiveTab(area)} className={`px-6 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${activeTab === area ? 'bg-slate-900 text-white shadow-lg scale-105' : 'bg-white text-slate-500 border border-slate-200 hover:border-slate-300'}`}>
-                  {area}
-              </button>
-          ))}
+      <div className="flex justify-between items-center mb-2">
+         <div className="flex gap-2 overflow-x-auto pb-4 no-scrollbar [-webkit-overflow-scrolling:touch]">
+             {allAreas.map(area => (
+                 <button key={area} onClick={() => setActiveTab(area)} className={`px-6 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${activeTab === area ? 'bg-slate-900 text-white shadow-lg scale-105' : 'bg-white text-slate-500 border border-slate-200 hover:border-slate-300'}`}>
+                     {area}
+                 </button>
+             ))}
+         </div>
+         <div className="flex bg-white rounded-xl border border-slate-200 p-1 text-xs font-bold hidden md:flex">
+             <button onClick={() => setSortBy('name')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'name' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>A-Z</button>
+             <button onClick={() => setSortBy('supplier')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'supplier' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>Supplier</button>
+         </div>
       </div>
       
       <div className="bg-white rounded-3xl shadow-sm border border-slate-100 divide-y divide-slate-100">
           
           {/* SECTION 1: RAW INGREDIENTS */}
-          {grouped[activeTab]?.map(ing => (
+          {grouped[activeTab]?.sort((a,b) => {
+              if(sortBy === 'supplier') return (a.supplier || '').localeCompare(b.supplier || '');
+              return a.name.localeCompare(b.name);
+          }).map(ing => (
               <div key={ing.id} className="p-6 hover:bg-slate-50 transition">
                   <div className="flex justify-between mb-4 items-center">
-                      <span className="font-bold text-lg text-slate-800">{ing.name}</span>
+                      <span className="font-bold text-lg text-slate-800">{ing.name} <span className="text-xs text-slate-400 font-normal ml-2">{ing.supplier}</span></span>
                       <span className="text-sm font-black text-blue-600 bg-blue-50 border border-blue-100 px-3 py-1.5 rounded-lg tracking-wide shadow-sm">System: {Math.round(ing.currentStock)} {ing.unit}</span>
                   </div>
                   <div className="flex flex-wrap gap-6 items-end">
@@ -1299,11 +1552,11 @@ function StockTake({ user, role, appId }) {
                               <div className="bg-white px-4 py-2 rounded-lg border border-yellow-200 shadow-sm flex-shrink-0">
                                    <span className="text-xs font-black text-yellow-600 uppercase tracking-wide block text-center">Count Portions</span>
                                    <input 
-                                      type="number" 
-                                      min="0" 
-                                      className="mt-1 w-24 text-center font-black text-xl outline-none bg-transparent" 
-                                      placeholder="0" 
-                                      onChange={(e) => handleCountChange(prep.id, 'base', e.target.value)} 
+                                       type="number" 
+                                       min="0" 
+                                       className="mt-1 w-24 text-center font-black text-xl outline-none bg-transparent" 
+                                       placeholder="0" 
+                                       onChange={(e) => handleCountChange(prep.id, 'base', e.target.value)} 
                                    />
                               </div>
                           </div>
@@ -1323,15 +1576,121 @@ function StockTake({ user, role, appId }) {
 
 function AdminStockReview({ appId, onClose }) {
   const [pending, setPending] = useState([]);
-  useEffect(() => { return onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'), orderBy('timestamp', 'desc')), (s) => setPending(s.docs.map(d => ({id: d.id, ...d.data()})).filter(d => d.status === 'pending'))); }, [appId]);
-  const approveCount = async (docId, items) => { const batch = writeBatch(db); items.forEach(item => batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', item.id), { currentStock: item.countedStock })); batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'stockCounts', docId), { status: 'approved', approvedAt: serverTimestamp() }); await batch.commit(); alert("Updated."); };
-  return <div className="bg-white p-4 md:p-8 rounded-2xl shadow-xl border border-slate-200"><div className="flex justify-between mb-6 pb-4 border-b border-slate-100 items-center"><h3 className="text-xl font-black text-slate-800">Pending Approvals</h3><button onClick={onClose} className="text-slate-400 hover:text-slate-800 font-bold">Close</button></div>{pending.length === 0 ? <p className="text-slate-400 italic text-center py-8">No pending counts.</p> : <div className="space-y-6">{pending.map(p => (<div key={p.id} className="border border-slate-200 rounded-xl p-6 shadow-sm"><div className="flex justify-between items-center mb-4 bg-slate-50 p-4 rounded-lg"><div><span className="text-sm font-bold text-slate-700 block">Submission</span><span className="text-xs text-slate-400 font-medium">{p.timestamp?.toDate().toLocaleString()}</span></div><button onClick={() => approveCount(p.id, p.items)} className="bg-green-500 text-white text-sm px-5 py-2 rounded-lg font-bold hover:bg-green-600 shadow-md">Approve</button></div><div className="overflow-x-auto"><table className="w-full text-xs text-left min-w-[300px]"><thead className="text-slate-400 uppercase font-bold border-b border-slate-100"><tr><th className="p-3">Item</th><th className="p-3 text-right">System</th><th className="p-3 text-right">Counted</th><th className="p-3 text-right">Var</th></tr></thead><tbody className="divide-y divide-slate-50">{p.items.map((item, i) => (<tr key={i}><td className="p-3 font-bold text-slate-700">{item.name}</td><td className="p-3 text-right text-slate-500">{Math.round(item.currentSystemStock)}</td><td className="p-3 text-right font-black">{item.countedStock}</td><td className={`p-3 text-right font-bold ${item.countedStock - item.currentSystemStock < 0 ? 'text-red-500' : 'text-green-500'}`}>{Math.round(item.countedStock - item.currentSystemStock)}</td></tr>))}</tbody></table></div></div>))}</div>}</div>;
+  
+  useEffect(() => { 
+    // Fetch pending counts
+    const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'), orderBy('timestamp', 'desc'));
+    return onSnapshot(q, (s) => setPending(s.docs.map(d => ({id: d.id, ...d.data()})).filter(d => d.status === 'pending'))); 
+  }, [appId]);
+
+  // --- NEW: Delete Function to remove stuck entries ---
+  const deleteCount = async (docId) => {
+    if(!window.confirm("Are you sure you want to delete this count? It will be removed permanently.")) return;
+    try {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'stockCounts', docId));
+    } catch (e) { alert("Error deleting: " + e.message); }
+  };
+
+  // --- UPDATED: Approve Function to save Variance Report ---
+  const approveCount = async (docId, items) => { 
+    const batch = writeBatch(db); 
+    
+    // 1. Update Inventory Levels
+    items.forEach(item => {
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', item.id);
+        batch.update(ref, { currentStock: item.countedStock }); 
+    });
+
+    // 2. Mark Count as Approved
+    batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'stockCounts', docId), { status: 'approved', approvedAt: serverTimestamp() }); 
+
+    // 3. Create Variance Report (The History Log)
+    const reportRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'variance_reports'));
+    const reportData = {
+        timestamp: serverTimestamp(),
+        type: 'stock_take',
+        title: 'Weekly Stock Take',
+        items: items.map(i => ({
+            name: i.name,
+            system: i.currentSystemStock || 0,
+            counted: i.countedStock || 0,
+            variance: (i.countedStock || 0) - (i.currentSystemStock || 0),
+            unit: i.unit
+        })).filter(i => Math.abs(i.variance) > 0.01) // Only save items with differences
+    };
+    batch.set(reportRef, reportData);
+
+    await batch.commit(); 
+    alert("Stock updated & Variance Report generated."); 
+  };
+
+  return (
+    <div className="bg-white p-4 md:p-8 rounded-2xl shadow-xl border border-slate-200">
+      <div className="flex justify-between mb-6 pb-4 border-b border-slate-100 items-center">
+        <h3 className="text-xl font-black text-slate-800">Pending Approvals</h3>
+        <button onClick={onClose} className="text-slate-400 hover:text-slate-800 font-bold">Close</button>
+      </div>
+      {pending.length === 0 ? 
+        <p className="text-slate-400 italic text-center py-8">No pending counts.</p> : 
+        <div className="space-y-6">
+          {pending.map(p => (
+            <div key={p.id} className="border border-slate-200 rounded-xl p-6 shadow-sm">
+              <div className="flex justify-between items-center mb-4 bg-slate-50 p-4 rounded-lg">
+                <div>
+                    <span className="text-sm font-bold text-slate-700 block">Submission</span>
+                    <span className="text-xs text-slate-400 font-medium">{p.timestamp?.toDate().toLocaleString()}</span>
+                    <p className="text-[10px] text-slate-400 mt-1 uppercase">By User ID: {p.submittedBy?.slice(0,5)}...</p>
+                </div>
+                <div className="flex gap-2">
+                    {/* NEW: Reject Button */}
+                    <button onClick={() => deleteCount(p.id)} className="bg-white border border-red-200 text-red-600 text-sm px-4 py-2 rounded-lg font-bold hover:bg-red-50">Reject / Delete</button>
+                    <button onClick={() => approveCount(p.id, p.items)} className="bg-green-500 text-white text-sm px-5 py-2 rounded-lg font-bold hover:bg-green-600 shadow-md">Approve</button>
+                </div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left min-w-[300px]">
+                    <thead className="text-slate-400 uppercase font-bold border-b border-slate-100"><tr><th className="p-3">Item</th><th className="p-3 text-right">System</th><th className="p-3 text-right">Counted</th><th className="p-3 text-right">Var</th></tr></thead>
+                    <tbody className="divide-y divide-slate-50">
+                        {p.items.map((item, i) => (
+                            <tr key={i}>
+                                <td className="p-3 font-bold text-slate-700">{item.name}</td>
+                                <td className="p-3 text-right text-slate-500">{Math.round(item.currentSystemStock * 100)/100}</td>
+                                <td className="p-3 text-right font-black">{item.countedStock}</td>
+                                <td className={`p-3 text-right font-bold ${item.countedStock - item.currentSystemStock < 0 ? 'text-red-500' : 'text-green-500'}`}>{Math.round((item.countedStock - item.currentSystemStock)*100)/100}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+              </div>
+            </div>
+          ))}
+        </div>
+      }
+    </div>
+  );
 }
 
 function ReceiveStock({ user, role, appId }) {
-  const [ingredients, setIngredients] = useState([]); const [pending, setPending] = useState([]); const [selId, setSelId] = useState(''); const [qty, setQty] = useState(''); const [uType, setUType] = useState('base'); const [showConfirm, setShowConfirm] = useState(false);
+  const [ingredients, setIngredients] = useState([]); 
+  const [pending, setPending] = useState([]); 
+  const [selId, setSelId] = useState(''); 
+  const [qty, setQty] = useState(''); 
+  const [uType, setUType] = useState('base'); 
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [sortBy, setSortBy] = useState('name'); // Added sort state
+
   useEffect(() => { return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => setIngredients(s.docs.map(d => ({id: d.id, ...d.data()})))); }, [appId]);
   
+  // UseMemo to sort the ingredients list for the dropdown
+  const sortedIngredients = useMemo(() => {
+    return [...ingredients].sort((a, b) => {
+        if (sortBy === 'supplier') {
+            return (a.supplier || '').localeCompare(b.supplier || '');
+        }
+        return a.name.localeCompare(b.name);
+    });
+  }, [ingredients, sortBy]);
+
   const add = (e) => { 
     e.preventDefault(); 
     if (!selId || !qty) return; 
@@ -1366,8 +1725,27 @@ function ReceiveStock({ user, role, appId }) {
       <ConfirmationModal isOpen={showConfirm} onClose={() => setShowConfirm(false)} onConfirm={commit} title="Confirm Stock Receipt?" message="This will immediately update inventory levels." />
       <div className="bg-white p-4 md:p-8 rounded-2xl shadow-sm border border-slate-200">
         <h2 className="text-xl font-black mb-6 flex items-center gap-2 text-slate-800"><Truck className="text-green-600"/> Receive Stock</h2>
+        
+        {/* NEW SORTING TOGGLE */}
+        <div className="mb-4 flex justify-end">
+            <div className="flex bg-white rounded-xl border border-slate-200 p-1 text-xs font-bold w-fit">
+                <button onClick={() => setSortBy('name')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'name' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>A-Z</button>
+                <button onClick={() => setSortBy('supplier')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'supplier' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>Supplier</button>
+            </div>
+        </div>
+
         <form onSubmit={add} className="flex flex-col md:flex-row gap-4 items-end">
-          <div className="flex-1 w-full"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Item</label><select required className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={selId} onChange={e => { setSelId(e.target.value); setUType('base'); }}><option value="">Select...</option>{ingredients.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}</select></div>
+          <div className="flex-1 w-full">
+            <label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Item</label>
+            <select required className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={selId} onChange={e => { setSelId(e.target.value); setUType('base'); }}>
+                <option value="">Select...</option>
+                {sortedIngredients.map(i => (
+                    <option key={i.id} value={i.id}>
+                        {i.name} {i.supplier ? `(${i.supplier})` : ''}
+                    </option>
+                ))}
+            </select>
+          </div>
           {selIng && <><div className="w-full md:w-32"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Qty</label><input required type="number" step="any" className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={qty} onChange={e => setQty(e.target.value)} /></div><div className="w-full md:w-40"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Unit</label><select className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={uType} onChange={e => setUType(e.target.value)}><option value="base">Base ({selIng.unit})</option>{Array.isArray(selIng.forms) && selIng.forms.map((f, i) => <option key={i} value={i}>{f.name}</option>)}</select></div></>}
           <button type="submit" className="w-full md:w-auto bg-slate-900 text-white px-8 py-3 rounded-lg font-bold hover:bg-slate-800 transition">Add</button>
         </form>
