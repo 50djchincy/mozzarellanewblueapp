@@ -436,30 +436,55 @@ function StockValueReport({ user, role, appId }) {
   );
 }
 
-// --- Ingredient Management ---
+// --- Ingredient & Prep Management ---
 function IngredientsManager({ user, role, appId }) {
+  const [activeTab, setActiveTab] = useState('raw'); // 'raw' or 'prep'
   const [ingredients, setIngredients] = useState([]);
+  const [prepItems, setPrepItems] = useState([]);
+  
+  // State for Ingredients
   const [isAdding, setIsAdding] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [search, setSearch] = useState('');
   const [viewMode, setViewMode] = useState('grid');
   const [confirmDelete, setConfirmDelete] = useState(null);
+
+  // State for Preps
+  const [isAddingPrep, setIsAddingPrep] = useState(false);
+  const [editingPrepId, setEditingPrepId] = useState(null);
+  const [selectedPrepIng, setSelectedPrepIng] = useState('');
+  const [selectedPrepQty, setSelectedPrepQty] = useState('');
   
-  // Removed moq from formData
+  // Form Data - Ingredients
   const [formData, setFormData] = useState({ 
     name: '', unit: 'g', cost: 0, minStock: 0, supplier: '', storageArea: 'Dry Storage', forms: [] 
   });
   const [newUnitName, setNewUnitName] = useState('');
   const [newUnitRatio, setNewUnitRatio] = useState('');
 
+  // Form Data - Preps
+  const [prepFormData, setPrepFormData] = useState({
+    name: '', storageArea: 'Back Fridge', composition: [] 
+  });
+
   useEffect(() => {
     if (!user) return;
-    const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), orderBy('name'));
-    return onSnapshot(q, (snap) => {
+    // Fetch Raw Ingredients
+    const qIng = query(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), orderBy('name'));
+    const unsubIng = onSnapshot(qIng, (snap) => {
       setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    }, (err) => console.error(err));
+    });
+    
+    // Fetch Prep Items
+    const qPrep = collection(db, 'artifacts', appId, 'public', 'data', 'prep_items');
+    const unsubPrep = onSnapshot(qPrep, (snap) => {
+      setPrepItems(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+
+    return () => { unsubIng(); unsubPrep(); };
   }, [user, appId]);
 
+  // --- Logic for Ingredients ---
   const filteredIngredients = ingredients.filter(i => 
     i.name.toLowerCase().includes(search.toLowerCase()) || 
     i.supplier?.toLowerCase().includes(search.toLowerCase())
@@ -472,7 +497,6 @@ function IngredientsManager({ user, role, appId }) {
         ...formData,
         cost: parseFloat(formData.cost) || 0,
         minStock: parseFloat(formData.minStock) || 0,
-        // Removed moq from submit
         ...(editingId ? {} : { currentStock: 0, createdAt: serverTimestamp() })
       };
 
@@ -496,7 +520,6 @@ function IngredientsManager({ user, role, appId }) {
     setFormData({
       name: ing.name, unit: ing.unit, cost: ing.cost, 
       minStock: ing.minStock || 0, 
-      // Removed moq from edit
       supplier: ing.supplier || '',
       storageArea: ing.storageArea, forms: ing.forms || []
     });
@@ -507,7 +530,6 @@ function IngredientsManager({ user, role, appId }) {
   const closeForm = () => {
     setIsAdding(false);
     setEditingId(null);
-    // Removed moq from reset
     setFormData({ name: '', unit: 'g', cost: 0, minStock: 0, supplier: '', storageArea: 'Dry Storage', forms: [] });
     setNewUnitName(''); setNewUnitRatio('');
   };
@@ -520,6 +542,44 @@ function IngredientsManager({ user, role, appId }) {
     setNewUnitName(''); setNewUnitRatio('');
   };
 
+  // --- Logic for Preps ---
+  const handlePrepSubmit = async (e) => {
+    e.preventDefault();
+    try {
+        if (editingPrepId) {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'prep_items', editingPrepId), prepFormData);
+        } else {
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'prep_items'), prepFormData);
+        }
+        closePrepForm();
+    } catch (err) { alert("Error saving prep item"); }
+  };
+
+  const deletePrep = async (id) => {
+      if(!window.confirm("Delete this prep item?")) return;
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'prep_items', id));
+  };
+
+  const addIngToPrep = () => {
+      if (!selectedPrepIng || !selectedPrepQty) return;
+      const ing = ingredients.find(i => i.id === selectedPrepIng);
+      const qty = parseFloat(selectedPrepQty);
+      if (!ing || isNaN(qty)) return;
+      
+      setPrepFormData(prev => ({
+          ...prev,
+          composition: [...prev.composition, { ingId: selectedPrepIng, name: ing.name, unit: ing.unit, qty }]
+      }));
+      setSelectedPrepIng(''); setSelectedPrepQty('');
+  };
+
+  const closePrepForm = () => {
+      setIsAddingPrep(false);
+      setEditingPrepId(null);
+      setPrepFormData({ name: '', storageArea: 'Back Fridge', composition: [] });
+  };
+
+  // --- RENDER FORMS ---
   if (isAdding) {
     return (
       <div className="bg-white p-4 md:p-8 rounded-3xl shadow-2xl max-w-2xl mx-auto border border-slate-100 animate-in zoom-in-95">
@@ -555,7 +615,6 @@ function IngredientsManager({ user, role, appId }) {
               <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Alert Low Stock</label>
               <input type="number" className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold" value={formData.minStock} onChange={e => setFormData({...formData, minStock: e.target.value})} placeholder="0" />
             </div>
-            {/* Removed MOQ Input */}
              <div className="col-span-2">
               <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Supplier</label>
               <input className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold" value={formData.supplier} onChange={e => setFormData({...formData, supplier: e.target.value})} />
@@ -577,71 +636,165 @@ function IngredientsManager({ user, role, appId }) {
     );
   }
 
+  if (isAddingPrep) {
+      return (
+        <div className="bg-white p-4 md:p-8 rounded-3xl shadow-2xl max-w-2xl mx-auto border border-slate-100 animate-in zoom-in-95">
+            <h3 className="text-2xl font-black text-slate-900 mb-6">{editingPrepId ? 'Edit Prep Item' : 'New Prep Composite'}</h3>
+            <p className="text-sm text-slate-500 mb-6 bg-blue-50 p-4 rounded-xl border border-blue-100">
+                <strong>How this works:</strong> Define a prepped item (like "Portioned Chicken") and list the raw ingredients inside ONE portion. 
+                When staff count this item during stock take, the system will automatically add these raw ingredients back to your main stock.
+            </p>
+            <form onSubmit={handlePrepSubmit} className="space-y-6">
+                <div className="grid grid-cols-2 gap-6">
+                    <div className="col-span-2 md:col-span-1">
+                        <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Prep Name</label>
+                        <input required className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold" value={prepFormData.name} onChange={e => setPrepFormData({...prepFormData, name: e.target.value})} placeholder="e.g. Chicken & Bacon Portion" />
+                    </div>
+                    <div className="col-span-2 md:col-span-1">
+                        <label className="block text-xs font-black text-slate-400 mb-2 uppercase tracking-wide">Storage Area</label>
+                        <select className="w-full border-2 border-slate-100 bg-slate-50 p-4 rounded-xl font-bold text-slate-700" value={prepFormData.storageArea} onChange={e => setPrepFormData({...prepFormData, storageArea: e.target.value})}>
+                            <option>Dry Storage</option>
+                            <option>Front Fridge</option>
+                            <option>Back Fridge</option>
+                            <option>Freezer 1</option>
+                            <option>Freezer 2</option>
+                            <option>Almari</option>
+                            <option>Veg and Fruits</option>
+                            <option>Bar</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div className="bg-red-50 p-4 md:p-6 rounded-2xl border border-red-100">
+                   <h4 className="font-black text-sm text-red-900 mb-4 uppercase tracking-wide">Composition (Ingredients per 1 Unit)</h4>
+                   <div className="flex flex-col md:flex-row gap-2 mb-4 items-end">
+                      <div className="flex-1 w-full"><label className="text-[10px] font-bold text-red-900 uppercase block mb-1">Raw Ingredient</label><select value={selectedPrepIng} onChange={(e) => setSelectedPrepIng(e.target.value)} className="w-full border-0 text-sm p-3 rounded-xl bg-white shadow-sm ring-1 ring-slate-200 font-medium text-slate-700"><option value="">Select...</option>{ingredients.map(i => <option key={i.id} value={i.id}>{i.name} ({i.unit})</option>)}</select></div>
+                      <div className="w-full md:w-24"><label className="text-[10px] font-bold text-red-900 uppercase block mb-1">Amount</label><input type="number" step="any" value={selectedPrepQty} onChange={(e) => setSelectedPrepQty(e.target.value)} className="w-full border-0 text-sm p-3 rounded-xl bg-white shadow-sm ring-1 ring-slate-200" placeholder="0.0" /></div>
+                      <button type="button" onClick={addIngToPrep} className="w-full md:w-auto bg-slate-900 text-white px-5 py-3 rounded-xl text-sm font-bold hover:bg-slate-800 shadow-md h-[44px]">Add</button>
+                   </div>
+                   <ul className="space-y-2 mb-4">{prepFormData.composition.map((c, i) => (<li key={i} className="flex justify-between items-center text-sm bg-white p-3 rounded-xl border border-red-100 shadow-sm"><span className="font-bold text-slate-700">{c.qty} {c.unit} {c.name}</span><button type="button" onClick={() => setPrepFormData(prev => ({...prev, composition: prev.composition.filter((_, idx) => idx !== i)}))} className="text-red-400 hover:text-red-600"><Trash2 size={16}/></button></li>))}</ul>
+                </div>
+
+                <div className="flex gap-4 justify-end pt-6 border-t border-slate-100"><button type="button" onClick={closePrepForm} className="px-6 py-3 text-slate-500 font-bold hover:text-slate-800">Cancel</button><button type="submit" className="px-8 py-3 bg-red-900 text-white rounded-xl font-black hover:bg-red-950 shadow-lg transition transform hover:-translate-y-1">Save Prep Item</button></div>
+            </form>
+        </div>
+      );
+  }
+
   return (
     <div>
       <ConfirmationModal isOpen={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={deleteIngredient} title="Delete Ingredient?" message="This will permanently delete this ingredient and may break recipes linked to it." />
-      <div className="flex flex-col md:flex-row md:justify-between md:items-center mb-8 gap-4">
+      <div className="flex flex-col md:flex-row md:justify-between md:items-center mb-6 gap-4">
         <div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Ingredients</h2><p className="text-slate-400 font-medium">Manage stock & costs</p></div>
-        <div className="flex flex-wrap gap-2 items-center">
-          <div className="relative w-full md:w-auto"><Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"/><input className="pl-10 pr-4 py-2 rounded-xl border border-slate-200 text-sm font-bold bg-white focus:outline-none focus:border-red-900 w-full md:w-64" placeholder="Search ingredients..." value={search} onChange={e => setSearch(e.target.value)} /></div>
-          <div className="flex bg-white rounded-xl border border-slate-200 p-1">
-             <button onClick={() => setViewMode('grid')} className={`p-2 rounded-lg transition ${viewMode === 'grid' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><Grid size={18}/></button>
-             <button onClick={() => setViewMode('list')} className={`p-2 rounded-lg transition ${viewMode === 'list' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><ListIcon size={18}/></button>
-          </div>
-          {role === 'admin' && <button onClick={() => { setEditingId(null); setFormData({ name: '', unit: 'g', cost: 0, minStock: 0, supplier: '', storageArea: 'Dry Storage', forms: [] }); setIsAdding(true); }} className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-xl hover:bg-slate-800 shadow-lg transition font-bold text-sm h-10"><Plus size={18} /> Add</button>}
+        
+        {/* Tab Switcher */}
+        <div className="bg-slate-100 p-1 rounded-xl flex gap-1 font-bold text-sm">
+             <button onClick={() => setActiveTab('raw')} className={`px-4 py-2 rounded-lg transition-all ${activeTab === 'raw' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-400 hover:text-slate-600'}`}>Raw Ingredients</button>
+             <button onClick={() => setActiveTab('prep')} className={`px-4 py-2 rounded-lg transition-all ${activeTab === 'prep' ? 'bg-white shadow-sm text-red-900' : 'text-slate-400 hover:text-slate-600'}`}>Prep Composites</button>
         </div>
       </div>
+      
+      {activeTab === 'raw' && (
+        <>
+            <div className="flex flex-wrap gap-2 items-center mb-6">
+                <div className="relative w-full md:w-auto"><Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"/><input className="pl-10 pr-4 py-2 rounded-xl border border-slate-200 text-sm font-bold bg-white focus:outline-none focus:border-red-900 w-full md:w-64" placeholder="Search ingredients..." value={search} onChange={e => setSearch(e.target.value)} /></div>
+                <div className="flex bg-white rounded-xl border border-slate-200 p-1">
+                    <button onClick={() => setViewMode('grid')} className={`p-2 rounded-lg transition ${viewMode === 'grid' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><Grid size={18}/></button>
+                    <button onClick={() => setViewMode('list')} className={`p-2 rounded-lg transition ${viewMode === 'list' ? 'bg-slate-100 text-slate-900' : 'text-slate-400'}`}><ListIcon size={18}/></button>
+                </div>
+                {role === 'admin' && <button onClick={() => { setEditingId(null); setFormData({ name: '', unit: 'g', cost: 0, minStock: 0, supplier: '', storageArea: 'Dry Storage', forms: [] }); setIsAdding(true); }} className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-xl hover:bg-slate-800 shadow-lg transition font-bold text-sm h-10"><Plus size={18} /> Add</button>}
+            </div>
 
-      {viewMode === 'grid' ? (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-           {filteredIngredients.map(ing => (
-             <div key={ing.id} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition group relative overflow-hidden">
-               <div className="absolute top-0 left-0 w-1.5 h-full bg-slate-200 group-hover:bg-red-900 transition-colors"></div>
-               <div className="flex justify-between items-start mb-4 pl-2">
-                 <div>
-                    <h3 className="font-black text-xl text-slate-800">{ing.name}</h3>
-                    <span className="text-[10px] font-black uppercase tracking-wide px-2 py-1 bg-slate-100 text-slate-400 rounded-md mt-1 inline-block">{ing.storageArea}</span>
-                 </div>
-                 <div className="text-right">
-                    <span className="block text-3xl font-black text-slate-900">{Math.round(ing.currentStock).toLocaleString()} <span className="text-sm font-bold text-slate-400">{ing.unit}</span></span>
-                    {role === 'admin' && (
-                      <div className="flex justify-end gap-2 mt-2">
-                          <button onClick={() => setConfirmDelete(ing.id)} className="text-red-300 hover:text-red-600"><Trash2 size={14}/></button>
-                          <button onClick={() => startEdit(ing)} className="text-blue-600 font-bold hover:underline text-xs flex items-center gap-1"><Edit2 size={10}/> Edit</button>
-                      </div>
-                    )}
-                 </div>
-               </div>
-               <div className="flex justify-between items-center pl-2 pt-4 border-t border-slate-50">
-                 <span className="text-xs font-bold text-slate-400">Cost: <span className="text-slate-700 font-mono">${Number(ing.cost || 0).toFixed(2)}</span>/{ing.unit}</span>
-                 {/* Removed MOQ display */}
-               </div>
-             </div>
-           ))}
-        </div>
-      ) : (
-        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm min-w-[600px]">
-              {/* Removed MOQ Header */}
-              <thead className="bg-slate-50 text-slate-400 uppercase font-black text-xs"><tr><th className="p-4">Name</th><th className="p-4">Area</th><th className="p-4 text-right">Stock</th><th className="p-4 text-right">Cost</th><th className="p-4 text-right">Actions</th></tr></thead>
-              <tbody className="divide-y divide-slate-100">
+            {viewMode === 'grid' ? (
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {filteredIngredients.map(ing => (
-                  <tr key={ing.id} className="hover:bg-slate-50/50">
-                    <td className="p-4 font-bold text-slate-800">{ing.name}</td>
-                    <td className="p-4"><span className="text-[10px] font-black uppercase bg-slate-100 text-slate-500 px-2 py-1 rounded">{ing.storageArea}</span></td>
-                    <td className="p-4 text-right font-black">{Math.round(ing.currentStock)} <span className="text-slate-400 text-xs">{ing.unit}</span></td>
-                    {/* Removed MOQ Cell */}
-                    <td className="p-4 text-right font-mono">${Number(ing.cost).toFixed(2)}</td>
-                    <td className="p-4 text-right flex justify-end gap-3">
-                      {role === 'admin' && <><button onClick={() => setConfirmDelete(ing.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => startEdit(ing)} className="text-blue-600 font-bold hover:underline">Edit</button></>}
-                    </td>
-                  </tr>
+                    <div key={ing.id} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition group relative overflow-hidden">
+                    <div className="absolute top-0 left-0 w-1.5 h-full bg-slate-200 group-hover:bg-red-900 transition-colors"></div>
+                    <div className="flex justify-between items-start mb-4 pl-2">
+                        <div>
+                        <h3 className="font-black text-xl text-slate-800">{ing.name}</h3>
+                        <span className="text-[10px] font-black uppercase tracking-wide px-2 py-1 bg-slate-100 text-slate-400 rounded-md mt-1 inline-block">{ing.storageArea}</span>
+                        </div>
+                        <div className="text-right">
+                        <span className="block text-3xl font-black text-slate-900">{Math.round(ing.currentStock).toLocaleString()} <span className="text-sm font-bold text-slate-400">{ing.unit}</span></span>
+                        {role === 'admin' && (
+                            <div className="flex justify-end gap-2 mt-2">
+                                <button onClick={() => setConfirmDelete(ing.id)} className="text-red-300 hover:text-red-600"><Trash2 size={14}/></button>
+                                <button onClick={() => startEdit(ing)} className="text-blue-600 font-bold hover:underline text-xs flex items-center gap-1"><Edit2 size={10}/> Edit</button>
+                            </div>
+                        )}
+                        </div>
+                    </div>
+                    <div className="flex justify-between items-center pl-2 pt-4 border-t border-slate-50">
+                        <span className="text-xs font-bold text-slate-400">Cost: <span className="text-slate-700 font-mono">${Number(ing.cost || 0).toFixed(2)}</span>/{ing.unit}</span>
+                    </div>
+                    </div>
                 ))}
-              </tbody>
-            </table>
+                </div>
+            ) : (
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm min-w-[600px]">
+                    <thead className="bg-slate-50 text-slate-400 uppercase font-black text-xs"><tr><th className="p-4">Name</th><th className="p-4">Area</th><th className="p-4 text-right">Stock</th><th className="p-4 text-right">Cost</th><th className="p-4 text-right">Actions</th></tr></thead>
+                    <tbody className="divide-y divide-slate-100">
+                        {filteredIngredients.map(ing => (
+                        <tr key={ing.id} className="hover:bg-slate-50/50">
+                            <td className="p-4 font-bold text-slate-800">{ing.name}</td>
+                            <td className="p-4"><span className="text-[10px] font-black uppercase bg-slate-100 text-slate-50 px-2 py-1 rounded">{ing.storageArea}</span></td>
+                            <td className="p-4 text-right font-black">{Math.round(ing.currentStock)} <span className="text-slate-400 text-xs">{ing.unit}</span></td>
+                            <td className="p-4 text-right font-mono">${Number(ing.cost).toFixed(2)}</td>
+                            <td className="p-4 text-right flex justify-end gap-3">
+                            {role === 'admin' && <><button onClick={() => setConfirmDelete(ing.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button><button onClick={() => startEdit(ing)} className="text-blue-600 font-bold hover:underline">Edit</button></>}
+                            </td>
+                        </tr>
+                        ))}
+                    </tbody>
+                    </table>
+                </div>
+                </div>
+            )}
+        </>
+      )}
+
+      {activeTab === 'prep' && (
+          <div className="animate-in fade-in slide-in-from-right-4">
+              <div className="flex justify-between items-center mb-6">
+                 <div>
+                    <h3 className="font-bold text-lg text-slate-800">Composite Items</h3>
+                    <p className="text-slate-400 text-sm">Items counted during stock take that contain multiple raw ingredients.</p>
+                 </div>
+                 {role === 'admin' && <button onClick={() => { setEditingPrepId(null); setPrepFormData({ name: '', storageArea: 'Back Fridge', composition: [] }); setIsAddingPrep(true); }} className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-xl hover:bg-slate-800 shadow-lg transition font-bold text-sm h-10"><Plus size={18} /> Add Composite</button>}
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {prepItems.map(prep => (
+                      <div key={prep.id} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition">
+                          <div className="flex justify-between items-start mb-4">
+                              <h3 className="font-black text-lg text-slate-800">{prep.name}</h3>
+                              <span className="text-[10px] font-black uppercase tracking-wide px-2 py-1 bg-blue-50 text-blue-600 rounded-md">{prep.storageArea}</span>
+                          </div>
+                          <div className="bg-slate-50 rounded-xl p-3 mb-4">
+                              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Contains per 1 unit:</p>
+                              <ul className="space-y-1">
+                                  {prep.composition?.map((c,i) => (
+                                      <li key={i} className="text-sm font-bold text-slate-700 flex justify-between">
+                                          <span>{c.name}</span>
+                                          <span className="font-mono text-slate-500">{c.qty} {c.unit}</span>
+                                      </li>
+                                  ))}
+                              </ul>
+                          </div>
+                          {role === 'admin' && (
+                              <div className="flex justify-end gap-3 pt-2 border-t border-slate-50">
+                                  <button onClick={() => deletePrep(prep.id)} className="text-red-300 hover:text-red-600"><Trash2 size={16}/></button>
+                                  <button onClick={() => { setPrepFormData(prep); setEditingPrepId(prep.id); setIsAddingPrep(true); }} className="text-blue-600 font-bold hover:underline text-xs">Edit</button>
+                              </div>
+                          )}
+                      </div>
+                  ))}
+                  {prepItems.length === 0 && <div className="col-span-full text-center py-10 text-slate-400 italic">No composite items defined yet.</div>}
+              </div>
           </div>
-        </div>
       )}
     </div>
   );
@@ -975,22 +1128,202 @@ function CSVUploader({ user, role, appId }) {
 }
 
 function StockTake({ user, role, appId }) {
-  const [ingredients, setIngredients] = useState([]); const [grouped, setGrouped] = useState({}); const [counts, setCounts] = useState({}); const [activeTab, setActiveTab] = useState('Dry Storage'); const [isReviewing, setIsReviewing] = useState(false); const [showPin, setShowPin] = useState(false);
-  useEffect(() => { return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => { const d = s.docs.map(doc => ({id: doc.id, ...doc.data()})); setIngredients(d); const g = {}; d.forEach(i => { if (!g[i.storageArea]) g[i.storageArea] = []; g[i.storageArea].push(i); }); setGrouped(g); if(Object.keys(g).length > 0 && !activeTab) setActiveTab(Object.keys(g)[0]); }); }, [appId, activeTab]);
-  const handleCountChange = (ingId, type, val) => { setCounts(prev => ({ ...prev, [ingId]: { ...prev[ingId], [type]: parseFloat(val) || 0 } })); };
-  const calculateTotal = (ing) => { const c = counts[ing.id] || {}; let total = c.base || 0; if (ing.forms) { ing.forms.forEach((f, idx) => { total += (c[`form_${idx}`] || 0) * f.ratio; }); } return total; };
-  const submitCount = async () => { await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'), { submittedBy: user.uid, timestamp: serverTimestamp(), status: 'pending', items: ingredients.map(ing => ({ id: ing.id, name: ing.name, currentSystemStock: ing.currentStock, countedStock: calculateTotal(ing), unit: ing.unit })) }); setCounts({}); alert("Submitted to Admin."); };
+  const [ingredients, setIngredients] = useState([]);
+  const [prepItems, setPrepItems] = useState([]); // New state for prep items
+  
+  const [grouped, setGrouped] = useState({});
+  const [groupedPrep, setGroupedPrep] = useState({}); // New grouping for preps
+  
+  const [counts, setCounts] = useState({}); 
+  const [activeTab, setActiveTab] = useState('Dry Storage'); 
+  const [isReviewing, setIsReviewing] = useState(false); 
+  const [showPin, setShowPin] = useState(false);
+
+  useEffect(() => {
+    // 1. Fetch Ingredients
+    const unsubIng = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => {
+      const d = s.docs.map(doc => ({id: doc.id, ...doc.data()}));
+      setIngredients(d);
+      
+      // Group Ingredients
+      const g = {};
+      d.forEach(i => {
+        if (!g[i.storageArea]) g[i.storageArea] = [];
+        g[i.storageArea].push(i);
+      });
+      setGrouped(g);
+      
+      // Set default tab if needed
+      if(Object.keys(g).length > 0 && !activeTab) setActiveTab(Object.keys(g)[0]);
+    });
+
+    // 2. Fetch Prep Items
+    const unsubPrep = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'prep_items'), (s) => {
+        const d = s.docs.map(doc => ({id: doc.id, ...doc.data()}));
+        setPrepItems(d);
+
+        // Group Prep Items
+        const g = {};
+        d.forEach(i => {
+            if (!g[i.storageArea]) g[i.storageArea] = [];
+            g[i.storageArea].push(i);
+        });
+        setGroupedPrep(g);
+    });
+
+    return () => { unsubIng(); unsubPrep(); };
+  }, [appId, activeTab]);
+
+  const handleCountChange = (id, type, val) => {
+    setCounts(prev => ({ ...prev, [id]: { ...prev[id], [type]: parseFloat(val) || 0 } }));
+  };
+
+  // Helper: Calculates visual total for a single row (Ingredient OR Prep)
+  const calculateRowTotal = (item) => {
+    const c = counts[item.id] || {};
+    let total = c.base || 0;
+    if (item.forms) {
+      item.forms.forEach((f, idx) => {
+        total += (c[`form_${idx}`] || 0) * f.ratio;
+      });
+    }
+    return total;
+  };
+
+  const submitCount = async () => {
+    // --- THE MAGIC LOGIC ---
+    // We need to consolidate counts. 
+    // 1. Get direct counts of raw ingredients.
+    // 2. Add the "invisible" amounts from the Prep items.
+
+    const finalCounts = {};
+
+    // Step 1: Initialize with direct raw counts
+    ingredients.forEach(ing => {
+        finalCounts[ing.id] = calculateRowTotal(ing);
+    });
+
+    // Step 2: Add Prep component amounts
+    prepItems.forEach(prep => {
+        const prepCount = counts[prep.id]?.base || 0; // Number of portions counted
+        if (prepCount > 0 && prep.composition) {
+            prep.composition.forEach(comp => {
+                // comp.ingId is the ID of the raw ingredient (e.g., Chicken ID)
+                // comp.qty is the amount per portion (e.g., 150g)
+                if (finalCounts[comp.ingId] !== undefined) {
+                    finalCounts[comp.ingId] += (prepCount * comp.qty);
+                }
+            });
+        }
+    });
+
+    // Step 3: Create the payload
+    const payloadItems = ingredients.map(ing => ({
+        id: ing.id,
+        name: ing.name,
+        currentSystemStock: ing.currentStock,
+        countedStock: finalCounts[ing.id] || 0,
+        unit: ing.unit
+    }));
+
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'), {
+      submittedBy: user.uid,
+      timestamp: serverTimestamp(),
+      status: 'pending',
+      items: payloadItems
+    });
+    
+    setCounts({});
+    alert("Submitted to Admin.");
+  };
+
   if (role === 'admin' && isReviewing) return <AdminStockReview appId={appId} onClose={() => setIsReviewing(false)} />;
+
+  // Combined tabs list (Ingredients + Prep areas)
+  const allAreas = Array.from(new Set([...Object.keys(grouped), ...Object.keys(groupedPrep)]));
+
   return (
     <div className="pb-24">
       <PinModal isOpen={showPin} onClose={() => setShowPin(false)} onSuccess={submitCount} appId={appId} title="Admin PIN Required" />
-      <div className="flex justify-between items-center mb-8"><div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Stock Take</h2><p className="text-slate-400 font-medium">Weekly Audit</p></div>{role === 'admin' && <button onClick={() => setIsReviewing(true)} className="bg-red-50 text-red-900 px-5 py-2.5 rounded-xl hover:bg-red-100 shadow-sm text-sm font-bold border border-red-200">Review Pending Counts</button>}</div>
       
-      {/* Scroll fix applied here as well */}
-      <div className="flex gap-2 overflow-x-auto pb-4 mb-2 no-scrollbar [-webkit-overflow-scrolling:touch]">{Object.keys(grouped).map(area => (<button key={area} onClick={() => setActiveTab(area)} className={`px-6 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${activeTab === area ? 'bg-slate-900 text-white shadow-lg scale-105' : 'bg-white text-slate-500 border border-slate-200 hover:border-slate-300'}`}>{area}</button>))}</div>
+      <div className="flex justify-between items-center mb-8">
+          <div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Stock Take</h2><p className="text-slate-400 font-medium">Weekly Audit</p></div>
+          {role === 'admin' && <button onClick={() => setIsReviewing(true)} className="bg-red-50 text-red-900 px-5 py-2.5 rounded-xl hover:bg-red-100 shadow-sm text-sm font-bold border border-red-200">Review Pending Counts</button>}
+      </div>
       
-      <div className="bg-white rounded-3xl shadow-sm border border-slate-100 divide-y divide-slate-100">{grouped[activeTab]?.map(ing => (<div key={ing.id} className="p-6 hover:bg-slate-50 transition"><div className="flex justify-between mb-4 items-center"><span className="font-bold text-lg text-slate-800">{ing.name}</span><span className="text-sm font-black text-blue-600 bg-blue-50 border border-blue-100 px-3 py-1.5 rounded-lg tracking-wide shadow-sm">System Stock: {Math.round(ing.currentStock)} {ing.unit}</span></div><div className="flex flex-wrap gap-6 items-end">{ing.forms?.map((f, idx) => (<div key={idx} className="flex flex-col"><label className="text-[10px] font-black text-red-900 mb-2 uppercase tracking-wide">{f.name}</label><input type="number" min="0" className="border border-red-100 bg-red-50 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-red-900 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, `form_${idx}`, e.target.value)} /></div>))}<div className="flex flex-col"><label className="text-[10px] font-black text-slate-400 mb-2 uppercase tracking-wide">Loose ({ing.unit})</label><input type="number" min="0" className="border border-slate-200 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-slate-400 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, 'base', e.target.value)} /></div><div className="ml-auto text-right"><span className="text-[10px] text-slate-400 block font-black uppercase tracking-wide">Counted Total</span><span className="font-black text-2xl text-slate-900">{calculateTotal(ing)} <span className="text-sm font-bold text-slate-400">{ing.unit}</span></span></div></div></div>))}</div>
-      <div className="fixed bottom-0 left-0 w-full bg-white/80 backdrop-blur-md border-t border-slate-200 p-4 md:pl-80 flex justify-end z-10 shadow-lg"><button onClick={() => setShowPin(true)} className="bg-slate-900 text-white font-bold py-3 px-10 rounded-xl shadow-xl hover:bg-slate-800 transition transform hover:-translate-y-1">Submit Count</button></div>
+      {/* Tabs */}
+      <div className="flex gap-2 overflow-x-auto pb-4 mb-2 no-scrollbar [-webkit-overflow-scrolling:touch]">
+          {allAreas.map(area => (
+              <button key={area} onClick={() => setActiveTab(area)} className={`px-6 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${activeTab === area ? 'bg-slate-900 text-white shadow-lg scale-105' : 'bg-white text-slate-500 border border-slate-200 hover:border-slate-300'}`}>
+                  {area}
+              </button>
+          ))}
+      </div>
+      
+      <div className="bg-white rounded-3xl shadow-sm border border-slate-100 divide-y divide-slate-100">
+          
+          {/* SECTION 1: RAW INGREDIENTS */}
+          {grouped[activeTab]?.map(ing => (
+              <div key={ing.id} className="p-6 hover:bg-slate-50 transition">
+                  <div className="flex justify-between mb-4 items-center">
+                      <span className="font-bold text-lg text-slate-800">{ing.name}</span>
+                      <span className="text-sm font-black text-blue-600 bg-blue-50 border border-blue-100 px-3 py-1.5 rounded-lg tracking-wide shadow-sm">System: {Math.round(ing.currentStock)} {ing.unit}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-6 items-end">
+                      {ing.forms?.map((f, idx) => (
+                          <div key={idx} className="flex flex-col">
+                              <label className="text-[10px] font-black text-red-900 mb-2 uppercase tracking-wide">{f.name}</label>
+                              <input type="number" min="0" className="border border-red-100 bg-red-50 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-red-900 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, `form_${idx}`, e.target.value)} />
+                          </div>
+                      ))}
+                      <div className="flex flex-col">
+                          <label className="text-[10px] font-black text-slate-400 mb-2 uppercase tracking-wide">Loose ({ing.unit})</label>
+                          <input type="number" min="0" className="border border-slate-200 rounded-xl p-3 w-24 text-center focus:ring-2 focus:ring-slate-400 outline-none font-bold text-slate-700" placeholder="0" onChange={(e) => handleCountChange(ing.id, 'base', e.target.value)} />
+                      </div>
+                      <div className="ml-auto text-right">
+                          <span className="text-[10px] text-slate-400 block font-black uppercase tracking-wide">Counted Total</span>
+                          <span className="font-black text-2xl text-slate-900">{calculateRowTotal(ing)} <span className="text-sm font-bold text-slate-400">{ing.unit}</span></span>
+                      </div>
+                  </div>
+              </div>
+          ))}
+
+          {/* SECTION 2: PREP ITEMS */}
+          {groupedPrep[activeTab] && groupedPrep[activeTab].length > 0 && (
+              <div className="bg-yellow-50/50">
+                  <div className="px-6 py-4 border-b border-yellow-100 bg-yellow-50 text-yellow-800 font-black text-xs uppercase tracking-widest flex items-center gap-2">
+                     <Utensils size={14} /> Prepared Items (Portions)
+                  </div>
+                  {groupedPrep[activeTab].map(prep => (
+                      <div key={prep.id} className="p-6 hover:bg-yellow-50 transition border-b border-yellow-100 last:border-0">
+                          <div className="flex justify-between mb-4 items-center">
+                              <div>
+                                  <span className="font-bold text-lg text-slate-900">{prep.name}</span>
+                                  <span className="block text-xs text-slate-400 font-bold mt-1">
+                                      Contains: {prep.composition?.map(c => `${c.qty}${c.unit} ${c.name}`).join(', ')}
+                                  </span>
+                              </div>
+                              <div className="bg-white px-4 py-2 rounded-lg border border-yellow-200 shadow-sm">
+                                   <span className="text-xs font-black text-yellow-600 uppercase tracking-wide block text-center">Count Portions</span>
+                                   <input 
+                                      type="number" 
+                                      min="0" 
+                                      className="mt-1 w-24 text-center font-black text-xl outline-none bg-transparent" 
+                                      placeholder="0" 
+                                      onChange={(e) => handleCountChange(prep.id, 'base', e.target.value)} 
+                                   />
+                              </div>
+                          </div>
+                      </div>
+                  ))}
+              </div>
+          )}
+
+      </div>
+      
+      <div className="fixed bottom-0 left-0 w-full bg-white/80 backdrop-blur-md border-t border-slate-200 p-4 md:pl-80 flex justify-end z-10 shadow-lg">
+          <button onClick={() => setShowPin(true)} className="bg-slate-900 text-white font-bold py-3 px-10 rounded-xl shadow-xl hover:bg-slate-800 transition transform hover:-translate-y-1">Submit Count</button>
+      </div>
     </div>
   );
 }
