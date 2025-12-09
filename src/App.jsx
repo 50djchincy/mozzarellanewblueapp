@@ -1129,10 +1129,10 @@ function CSVUploader({ user, role, appId }) {
 
 function StockTake({ user, role, appId }) {
   const [ingredients, setIngredients] = useState([]);
-  const [prepItems, setPrepItems] = useState([]); // New state for prep items
+  const [prepItems, setPrepItems] = useState([]); 
   
   const [grouped, setGrouped] = useState({});
-  const [groupedPrep, setGroupedPrep] = useState({}); // New grouping for preps
+  const [groupedPrep, setGroupedPrep] = useState({});
   
   const [counts, setCounts] = useState({}); 
   const [activeTab, setActiveTab] = useState('Dry Storage'); 
@@ -1153,7 +1153,6 @@ function StockTake({ user, role, appId }) {
       });
       setGrouped(g);
       
-      // Set default tab if needed
       if(Object.keys(g).length > 0 && !activeTab) setActiveTab(Object.keys(g)[0]);
     });
 
@@ -1178,7 +1177,6 @@ function StockTake({ user, role, appId }) {
     setCounts(prev => ({ ...prev, [id]: { ...prev[id], [type]: parseFloat(val) || 0 } }));
   };
 
-  // Helper: Calculates visual total for a single row (Ingredient OR Prep)
   const calculateRowTotal = (item) => {
     const c = counts[item.id] || {};
     let total = c.base || 0;
@@ -1191,11 +1189,7 @@ function StockTake({ user, role, appId }) {
   };
 
   const submitCount = async () => {
-    // --- THE MAGIC LOGIC ---
-    // We need to consolidate counts. 
-    // 1. Get direct counts of raw ingredients.
-    // 2. Add the "invisible" amounts from the Prep items.
-
+    // --- UPDATED MATH LOGIC ---
     const finalCounts = {};
 
     // Step 1: Initialize with direct raw counts
@@ -1205,14 +1199,14 @@ function StockTake({ user, role, appId }) {
 
     // Step 2: Add Prep component amounts
     prepItems.forEach(prep => {
-        const prepCount = counts[prep.id]?.base || 0; // Number of portions counted
+        const prepCount = counts[prep.id]?.base || 0; 
         if (prepCount > 0 && prep.composition) {
             prep.composition.forEach(comp => {
-                // comp.ingId is the ID of the raw ingredient (e.g., Chicken ID)
-                // comp.qty is the amount per portion (e.g., 150g)
-                if (finalCounts[comp.ingId] !== undefined) {
-                    finalCounts[comp.ingId] += (prepCount * comp.qty);
+                // SAFETY FIX: Ensure the entry exists before adding
+                if (finalCounts[comp.ingId] === undefined) {
+                    finalCounts[comp.ingId] = 0;
                 }
+                finalCounts[comp.ingId] += (prepCount * comp.qty);
             });
         }
     });
@@ -1239,7 +1233,6 @@ function StockTake({ user, role, appId }) {
 
   if (role === 'admin' && isReviewing) return <AdminStockReview appId={appId} onClose={() => setIsReviewing(false)} />;
 
-  // Combined tabs list (Ingredients + Prep areas)
   const allAreas = Array.from(new Set([...Object.keys(grouped), ...Object.keys(groupedPrep)]));
 
   return (
@@ -1251,7 +1244,6 @@ function StockTake({ user, role, appId }) {
           {role === 'admin' && <button onClick={() => setIsReviewing(true)} className="bg-red-50 text-red-900 px-5 py-2.5 rounded-xl hover:bg-red-100 shadow-sm text-sm font-bold border border-red-200">Review Pending Counts</button>}
       </div>
       
-      {/* Tabs */}
       <div className="flex gap-2 overflow-x-auto pb-4 mb-2 no-scrollbar [-webkit-overflow-scrolling:touch]">
           {allAreas.map(area => (
               <button key={area} onClick={() => setActiveTab(area)} className={`px-6 py-2 rounded-full text-sm font-bold whitespace-nowrap transition-all ${activeTab === area ? 'bg-slate-900 text-white shadow-lg scale-105' : 'bg-white text-slate-500 border border-slate-200 hover:border-slate-300'}`}>
@@ -1303,7 +1295,8 @@ function StockTake({ user, role, appId }) {
                                       Contains: {prep.composition?.map(c => `${c.qty}${c.unit} ${c.name}`).join(', ')}
                                   </span>
                               </div>
-                              <div className="bg-white px-4 py-2 rounded-lg border border-yellow-200 shadow-sm">
+                              {/* ALIGNMENT FIX: Added flex-shrink-0 */}
+                              <div className="bg-white px-4 py-2 rounded-lg border border-yellow-200 shadow-sm flex-shrink-0">
                                    <span className="text-xs font-black text-yellow-600 uppercase tracking-wide block text-center">Count Portions</span>
                                    <input 
                                       type="number" 
