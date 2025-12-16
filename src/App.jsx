@@ -417,6 +417,73 @@ export default function InventoryApp() {
       end.setHours(23,59,59,999);
       return logs.filter(l => { if (!l.timestamp) return false; const d = l.timestamp.toDate(); return d >= start && d <= end; });
     }, [logs, dateRange, customStart, customEnd]);
+    // Insert this block around line 506, right after the definition of filteredLogs
+
+        // --- NEW LOGIC: Daily Variance Aggregation ---
+        const dailyVarianceData = useMemo(() => {
+            // 1. Set the date range for filtering
+            const now = new Date();
+            let start = new Date(0); // Default: Epoch start
+            let end = new Date();
+            end.setHours(23, 59, 59, 999); // Default: End of today
+    
+            if (dateRange === 'today') start.setHours(0, 0, 0, 0);
+            else if (dateRange === 'week') start.setDate(now.getDate() - 7);
+            else if (dateRange === 'month') start.setMonth(now.getMonth() - 1);
+            else if (dateRange === 'custom') { 
+                start = customStart ? new Date(customStart) : start; 
+                end = customEnd ? new Date(customEnd) : end;
+                end.setHours(23, 59, 59, 999);
+            }
+    
+            const filteredReports = varianceReports.filter(r => {
+                if (!r.timestamp) return false;
+                const d = r.timestamp.toDate();
+                return d >= start && d <= end;
+            });
+    
+            const comparisonMap = {};
+    
+            filteredReports.forEach(report => {
+                // Process each item in the report
+                report.items.forEach(item => {
+                    // Create a unique key for the ingredient (Name + Unit)
+                    const id = item.name + item.unit; 
+    
+                    if (!comparisonMap[id]) {
+                        comparisonMap[id] = {
+                            name: item.name,
+                            unit: item.unit,
+                            systemStart: item.system || 0, // Stock before any action
+                            systemEnd: item.system || 0, // Stock updated after sales/deductions
+                            countedEnd: null, // Actual physical count (only set by stock_take)
+                        };
+                    }
+                    
+                    if (report.type === 'sales_deduction') {
+                        // Sales Report: The variance is the deduction amount (negative)
+                        // Update systemEnd by applying the deduction
+                        comparisonMap[id].systemEnd += item.variance;
+                    } 
+                    
+                    if (report.type === 'stock_take') {
+                        // Stock Take Report: This is the FINAL PHYSICAL count
+                        comparisonMap[id].countedEnd = item.counted;
+                    }
+                });
+            });
+    
+            // Finalize variance calculation: Variance = System Stock after Sales - Physical Count
+            return Object.values(comparisonMap)
+                .filter(item => item.countedEnd !== null) // Only show items that were physically counted
+                .map(item => ({
+                    ...item,
+                    varianceDifference: Math.round((item.systemEnd - item.countedEnd) * 100) / 100,
+                    cost: ingredients.find(i => i.name === item.name)?.cost || 0
+                }))
+                .sort((a, b) => Math.abs(b.varianceDifference) - Math.abs(a.varianceDifference)); // Sort by largest absolute variance
+    
+        }, [varianceReports, dateRange, customStart, customEnd, ingredients]);
   
     const lowStockItems = ingredients.filter(i => (i.currentStock || 0) <= (i.minStock || 0));
     const groupedOrders = lowStockItems.reduce((acc, item) => { const supp = item.supplier || 'Unassigned'; if (!acc[supp]) acc[supp] = []; acc[supp].push(item); return acc; }, {});
@@ -460,14 +527,15 @@ export default function InventoryApp() {
     return (
       <div className="max-w-6xl mx-auto space-y-6">
          <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-           <div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Reports & Orders</h2><p className="text-slate-400 font-medium">Business Intelligence Center</p></div>
-           <div className="flex bg-white rounded-xl border border-slate-200 p-1 shadow-sm overflow-x-auto max-w-full">
-             {/* Logic Change: Hide Insights, Logs, History from Staff */}
-             {role === 'admin' && <button onClick={() => setTab('insights')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'insights' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Insights</button>}
-             <button onClick={() => setTab('orders')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap flex items-center gap-2 ${tab === 'orders' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Order Sheet {lowStockItems.length > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{lowStockItems.length}</span>}</button>
-             {role === 'admin' && <button onClick={() => setTab('logs')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'logs' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Activity Log</button>}
-             {role === 'admin' && <button onClick={() => setTab('history')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'history' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>History & Variance</button>}
-           </div>
+         <div><h2 className="text-3xl font-black text-slate-900 tracking-tight">Reports & Orders</h2><p className="text-slate-400 font-medium">Business Intelligence Center</p></div>
+           <div className="flex bg-white rounded-xl border border-slate-200 p-1 shadow-sm overflow-x-auto max-w-full">
+             {/* Logic Change: Hide Insights, Logs, History from Staff */}
+             {role === 'admin' && <button onClick={() => setTab('insights')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'insights' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Insights</button>}
+             <button onClick={() => setTab('orders')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap flex items-center gap-2 ${tab === 'orders' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Order Sheet {lowStockItems.length > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{lowStockItems.length}</span>}</button>
+             {role === 'admin' && <button onClick={() => setTab('logs')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'logs' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Activity Log</button>}
+             {role === 'admin' && <button onClick={() => setTab('variance')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'variance' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Daily Variance</button>}
+             {role === 'admin' && <button onClick={() => setTab('history')} className={`px-4 py-2 rounded-lg text-sm font-bold transition whitespace-nowrap ${tab === 'history' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>History & Variance</button>}
+           </div>
          </div>
   
          {tab === 'insights' && (
@@ -615,7 +683,62 @@ export default function InventoryApp() {
                )}
              </div>
          )}
-         
+         {/* --- NEW: DAILY VARIANCE REPORT VIEW --- */}
+                  {tab === 'variance' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4">
+                <div className="bg-slate-900 text-white p-6 rounded-3xl shadow-xl">
+                    <h3 className="text-2xl font-black">Daily Variance Analysis</h3>
+                    <p className="text-slate-400 text-sm mt-1">System Stock (Post-Sales) vs. Physical Stock (Post-Count)</p>
+                </div>
+
+                {dailyVarianceData.length === 0 ? (
+                    <div className="bg-white p-12 rounded-3xl border border-dashed border-slate-300 text-center">
+                        <Info className="mx-auto text-slate-400 mb-4" size={48} />
+                        <h3 className="text-xl font-black text-slate-800">No Variance Data</h3>
+                        <p className="text-slate-500 font-medium mt-2">Ensure both **Sales Deductions** and **Stock Counts** have been approved by an Admin for this period.</p>
+                    </div>
+                ) : (
+                    <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-left text-sm min-w-[700px]">
+                                <thead className="bg-slate-50 text-slate-400 uppercase font-black text-xs sticky top-0">
+                                    <tr>
+                                        <th className="p-4">Item</th>
+                                        <th className="p-4 text-right">System Stock (Post-Sales)</th>
+                                        <th className="p-4 text-right">Physical Count</th>
+                                        <th className="p-4 text-right">Difference (Variance)</th>
+                                        <th className="p-4 text-right">Est. Loss Value</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                    {dailyVarianceData.map(item => {
+                                        const lossValue = Math.abs(item.varianceDifference * item.cost);
+                                        const isLoss = item.varianceDifference > 0;
+                                        return (
+                                            <tr key={item.name} className={`hover:bg-slate-50/50 transition ${isLoss && 'bg-red-50/50'}`}>
+                                                <td className="p-4 font-bold text-slate-800 flex items-center gap-2">
+                                                    {isLoss && <Tag size={14} className="text-red-500"/>}
+                                                    {item.name}
+                                                    <span className="text-[10px] text-slate-400 ml-1">({item.unit})</span>
+                                                </td>
+                                                <td className="p-4 text-right font-medium text-slate-600">{item.systemEnd.toFixed(2)}</td>
+                                                <td className="p-4 text-right font-medium text-green-600">{item.countedEnd.toFixed(2)}</td>
+                                                <td className={`p-4 text-right font-black ${isLoss ? 'text-red-700' : 'text-green-700'}`}>
+                                                    {item.varianceDifference > 0 ? '+' : ''}{item.varianceDifference.toFixed(2)}
+                                                </td>
+                                                <td className={`p-4 text-right font-black ${isLoss ? 'text-red-900' : 'text-slate-400'}`}>
+                                                    {isLoss ? `Rs ${lossValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'N/A'}
+                                                </td>
+                                            </tr>
+                                      );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                )}
+            </div>
+        )}
          {tab === 'logs' && (
            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4">
               <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
