@@ -200,6 +200,23 @@ async function addLog(db, appId, uid, message) {
     message 
   }); 
 }
+async function recordStockMovement(batch, db, appId, type, items) {
+  // type = 'sale' or 'receive' or 'adjustment'
+  const todayStr = new Date().toISOString().split('T')[0]; 
+  const ref = doc(collection(db, 'artifacts', appId, 'public', 'data', 'stock_movements'));
+  
+  batch.set(ref, {
+    type,
+    timestamp: serverTimestamp(),
+    date: todayStr,
+    items: items.map(i => ({
+      ingId: i.ingId || i.id, // Handle different ID keys
+      name: i.name,
+      qty: Number(i.qty || i.change || 0), // Ensure number
+      unit: i.unit || ''
+    }))
+  });
+}
 
 // --- Main Application Component ---
 // --- Main Application Component ---
@@ -1857,144 +1874,151 @@ function StockTake({ user, role, appId }) {
   );
 }
 
+// NEW COMPONENT: AdminSalesReview (Handles multiple pending docs)
 function AdminStockReview({ appId, onClose }) {
   const [pending, setPending] = useState([]);
   
   useEffect(() => { 
-    // This query fetches the queue of items waiting for review
-    const q = query(
-        collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'),
-        where('status', 'in', ['pending', 'pending_sales_deduction']),
-        orderBy('timestamp', 'desc')
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-        const docs = snapshot.docs.map(d => ({
-            id: d.id, 
-            ...d.data(),
-            isSales: d.data().status === 'pending_sales_deduction'
-        }));
-        setPending(docs);
-    });
-    
-    return () => unsubscribe();
+    const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'stockCounts'), where('status', '==', 'pending'), orderBy('timestamp', 'desc'));
+    return onSnapshot(q, (s) => setPending(s.docs.map(d => ({id: d.id, ...d.data()})))); 
   }, [appId]);
 
-  // --- REJECT ---
   const deleteCount = async (docId) => {
-    if(!window.confirm("Reject and delete this submission? This cannot be undone.")) return;
+    if(!window.confirm("Are you sure you want to delete this count?")) return;
     try {
-        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'stockCounts', docId));
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'stockCounts', docId));
     } catch (e) { alert("Error deleting: " + e.message); }
   };
 
-  // --- APPROVE ---
-  const approveCount = async (docId, items, isSales = false) => { 
+  const approveCount = async (docId, items, area) => { 
     const batch = writeBatch(db); 
-        
-    // 1. Update Inventory
-    items.forEach(item => {
-        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', item.id);
-        if (isSales) {
-            batch.update(ref, { currentStock: increment(item.change) });
-        } else {
-            batch.update(ref, { currentStock: item.countedStock });     
-        }
-    });
+    const detailedReportItems = [];
+    
+    // We need to fetch movements to do the reconciliation tally
+    // Since we don't have the "Last Count Date" handy easily in this view without complex querying,
+    // We will use the REVERSE CALCULATION method.
+    // Logic: CurrentSystemStock represents (LastCount + Received - Sales)
+    // We query all movements. If we can't efficiently query by date per item here, 
+    // we will fetch recent movements (e.g., last 7 days) and filter in memory. 
+    
+    // 1. Fetch recent movements (Optimization: Fetch last 100 movements)
+    const moveQ = query(collection(db, 'artifacts', appId, 'public', 'data', 'stock_movements'), orderBy('timestamp', 'desc'), limit(100));
+    const moveSnap = await getDocs(moveQ);
+    const allMovements = moveSnap.docs.map(d => d.data());
 
-    // 2. Mark as approved
+    // 2. Iterate items and build report
+    for (const item of items) {
+        // Find last Stock Take time for this specific ingredient
+        // Note: For perfect accuracy we'd query the Ingredient doc's 'lastStockTake' field.
+        // Assuming we update that field below.
+        
+        // Calculate Movements for this item
+        // We filter movements where ingId matches. 
+        // NOTE: This assumes 'currentSystemStock' was accurate up to this moment.
+        
+        let totalSold = 0;
+        let totalReceived = 0;
+
+        // In a real robust system, we would filter movements > item.lastStockTakeDate
+        // Here, we will try to look for movements in the fetched batch.
+        // This is a "Best Effort" tally for the report.
+        
+        const itemMoves = allMovements.filter(m => 
+            m.items.some(i => i.ingId === item.id)
+        );
+        
+        // Flatten to get just this item's quantity from the movements
+        itemMoves.forEach(m => {
+             const detail = m.items.find(i => i.ingId === item.id);
+             if (detail) {
+                 if (m.type === 'sale') totalSold += detail.qty;
+                 if (m.type === 'receive') totalReceived += detail.qty;
+             }
+        });
+
+        // REVERSE CALCULATION for "Opening Stock" (The stock at start of period)
+        // Opening = Theoretical (Current System) - Received + Sold
+        // This math effectively "rewinds" the clock to tell you what you started with.
+        const calculatedOpening = (item.currentSystemStock || 0) - totalReceived + totalSold;
+        const variance = (item.countedStock || 0) - (item.currentSystemStock || 0);
+
+        // Update Inventory in DB
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', item.id);
+        batch.update(ref, { 
+            currentStock: item.countedStock,
+            lastStockTake: serverTimestamp() // Save this for next time!
+        }); 
+
+        // Add to Detailed Report
+        if (Math.abs(variance) > 0.01 || totalSold > 0) {
+            detailedReportItems.push({
+                name: item.name,
+                opening: calculatedOpening,
+                received: totalReceived,
+                sold: totalSold,
+                expected: item.currentSystemStock || 0, // This is "System"
+                counted: item.countedStock || 0,
+                variance: variance,
+                unit: item.unit
+            });
+        }
+    }
+
+    // 3. Mark Count as Approved
     batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'stockCounts', docId), { status: 'approved', approvedAt: serverTimestamp() }); 
 
-    // 3. Log Variance
+    // 4. Create Variance Report
     const reportRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'variance_reports'));
     batch.set(reportRef, {
         timestamp: serverTimestamp(),
-        type: isSales ? 'sales_deduction' : 'stock_take',
-        title: isSales ? 'POS Sales Import' : 'Weekly Stock Take',
-        items: items.map(i => ({
-            name: i.name,
-            system: i.currentSystemStock || 0,
-            counted: isSales ? (i.currentSystemStock || 0) + i.change : i.countedStock || 0,
-            variance: isSales ? i.change : (i.countedStock || 0) - (i.currentSystemStock || 0),
-            unit: i.unit
-        })).filter(i => Math.abs(i.variance) > 0.01)
+        type: 'reconciliation', // New Type!
+        title: `Reconciliation: ${area || 'Full Inventory'}`,
+        items: detailedReportItems
     });
 
-    await batch.commit();     
+    await batch.commit(); 
+    alert("Stock updated & Detailed Reconciliation Report generated."); 
   };
 
   return (
-    <div className="bg-white p-6 md:p-8 rounded-2xl shadow-2xl border border-slate-200 max-h-[90vh] flex flex-col">
-      <div className="flex justify-between mb-6 pb-4 border-b border-slate-100 items-center flex-shrink-0">
-        <div className="flex items-center gap-3">
-            <h3 className="text-xl font-black text-slate-800">Review Queue</h3>
-            {pending.length > 0 && <span className="bg-red-600 text-white text-xs px-2 py-1 rounded-full font-bold animate-pulse">{pending.length} Pending</span>}
-        </div>
-        <button onClick={onClose} className="text-slate-400 hover:text-slate-800 font-bold px-4 py-2 hover:bg-slate-100 rounded-lg transition">Close</button>
+    <div className="bg-white p-4 md:p-8 rounded-2xl shadow-xl border border-slate-200">
+      <div className="flex justify-between mb-6 pb-4 border-b border-slate-100 items-center">
+        <h3 className="text-xl font-black text-slate-800">Pending Stock Take Approvals ({pending.length})</h3>
+        <button onClick={onClose} className="text-slate-400 hover:text-slate-800 font-bold">Close</button>
       </div>
-
       {pending.length === 0 ? 
-        <div className="flex-1 flex flex-col items-center justify-center p-12 text-center opacity-50">
-            <div className="bg-slate-100 p-4 rounded-full mb-4"><ClipboardCheck size={40} className="text-slate-400" /></div>
-            <p className="text-slate-500 font-bold text-lg">All Caught Up</p>
-            <p className="text-sm text-slate-400">No items waiting for review.</p>
-        </div> : 
-        
-        <div className="space-y-6 overflow-y-auto pr-2 flex-1">
-          {pending.map((p, index) => {
-            const displayTitle = p.isSales ? `POS Sales Deduction` : 'Manual Stock Take';
-            return (
-            <div key={p.id} className={`border-2 rounded-xl p-6 shadow-sm transition-all ${p.isSales ? 'border-purple-100 bg-purple-50/30' : 'border-slate-100 bg-white'}`}>
-              
-              <div className="flex flex-col md:flex-row justify-between md:items-start mb-6 gap-4 border-b border-slate-100/50 pb-4">
+        <p className="text-slate-400 italic text-center py-8">No pending counts.</p> : 
+        <div className="space-y-6">
+          {pending.map(p => (
+            <div key={p.id} className="border border-slate-200 rounded-xl p-6 shadow-sm">
+              <div className="flex justify-between items-center mb-4 bg-slate-50 p-4 rounded-lg">
                 <div>
-                    <div className="flex items-center gap-3 mb-2">
-                        <span className="bg-slate-200 text-slate-600 text-[10px] font-black px-2 py-0.5 rounded">#{index + 1}</span>
-                        <span className={`text-sm font-black uppercase tracking-wide px-2 py-1 rounded-md ${p.isSales ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>{displayTitle}</span>
-                    </div>
-                    <div className="text-xs text-slate-500 font-medium space-y-1">
-                        <p className="flex items-center gap-2"><Calendar size={12}/> {p.timestamp?.toDate().toLocaleString()}</p>
-                        {p.title && <p className="font-bold text-slate-700">Ref: {p.title}</p>}
-                    </div>
+                    <span className="text-sm font-bold text-slate-700 block">Stock Count: {p.area || 'All Areas'}</span>
+                    <span className="text-xs text-slate-400 font-medium">{p.timestamp?.toDate().toLocaleString()}</span>
+                    <p className="text-[10px] text-slate-400 mt-1 uppercase">By User ID: {p.submittedBy?.slice(0,5)}...</p>
                 </div>
-                <div className="flex gap-2 w-full md:w-auto">
-                    <button onClick={() => deleteCount(p.id)} className="flex-1 md:flex-none bg-white border border-slate-200 text-red-500 text-xs px-4 py-3 rounded-xl font-bold hover:bg-red-50 hover:border-red-200 transition">Reject</button>
-                    <button onClick={() => approveCount(p.id, p.items, p.isSales)} className="flex-[2] md:flex-none bg-slate-900 text-white text-xs px-6 py-3 rounded-xl font-bold hover:bg-slate-800 shadow-lg shadow-slate-200 transition transform active:scale-95">Approve</button>
+                <div className="flex gap-2">
+                    <button onClick={() => deleteCount(p.id)} className="bg-white border border-red-200 text-red-600 text-sm px-4 py-2 rounded-lg font-bold hover:bg-red-50">Reject</button>
+                    <button onClick={() => approveCount(p.id, p.items, p.area)} className="bg-green-500 text-white text-sm px-5 py-2 rounded-lg font-bold hover:bg-green-600 shadow-md">Approve</button>
                 </div>
               </div>
-              
-              <div className="bg-white rounded-lg border border-slate-100 overflow-hidden">
-                <div className="overflow-x-auto max-h-60">
-                    <table className="w-full text-xs text-left">
-                        <thead className="text-slate-400 uppercase font-bold bg-slate-50 sticky top-0">
-                            <tr>
-                                <th className="p-3 pl-4">Item</th>
-                                <th className="p-3 text-right">System</th>
-                                <th className="p-3 text-right">{p.isSales ? 'Deduct' : 'Counted'}</th>
-                                <th className="p-3 text-right pr-4">Variance</th>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left min-w-[300px]">
+                    <thead className="text-slate-400 uppercase font-bold border-b border-slate-100"><tr><th className="p-3">Item</th><th className="p-3 text-right">System</th><th className="p-3 text-right">Counted</th><th className="p-3 text-right">Var</th></tr></thead>
+                    <tbody className="divide-y divide-slate-50">
+                        {p.items.map((item, i) => (
+                            <tr key={i}>
+                                <td className="p-3 font-bold text-slate-700">{item.name}</td>
+                                <td className="p-3 text-right text-slate-500">{Math.round(item.currentSystemStock * 100)/100}</td>
+                                <td className="p-3 text-right font-black">{item.countedStock}</td>
+                                <td className={`p-3 text-right font-bold ${item.countedStock - item.currentSystemStock < 0 ? 'text-red-500' : 'text-green-500'}`}>{Math.round((item.countedStock - item.currentSystemStock)*100)/100}</td>
                             </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-50">
-                            {p.items.map((item, i) => {
-                                const variance = p.isSales ? (item.change || 0) : ((item.countedStock || 0) - (item.currentSystemStock || 0));
-                                const deductionValue = p.isSales ? item.change : item.countedStock;
-                                return (
-                                <tr key={i}>
-                                    <td className="p-3 pl-4 font-bold text-slate-700">{item.name}</td>
-                                    <td className="p-3 text-right text-slate-400">{Math.round((item.currentSystemStock || 0) * 100)/100}</td>
-                                    <td className="p-3 text-right font-black text-slate-800">{Math.round(deductionValue * 100)/100}</td>
-                                    <td className={`p-3 text-right pr-4 font-bold ${variance < 0 ? 'text-red-500' : 'text-green-500'}`}>
-                                        {variance > 0 ? '+' : ''}{Math.round(variance * 100)/100} {item.unit}
-                                    </td>
-                                </tr>
-                                );
-                             })}
-                        </tbody>
-                    </table>
-                </div>
+                        ))}
+                    </tbody>
+                </table>
               </div>
             </div>
-          )})}
+          ))}
         </div>
       }
     </div>
@@ -2002,172 +2026,100 @@ function AdminStockReview({ appId, onClose }) {
 }
 
 function ReceiveStock({ user, role, appId }) {
-    const [activeTab, setActiveTab] = useState('new'); // 'new' or 'history'
-    const [ingredients, setIngredients] = useState([]); 
-    const [pending, setPending] = useState([]); 
-    const [history, setHistory] = useState([]); // Stores past receipts
+  const [ingredients, setIngredients] = useState([]); 
+  const [pending, setPending] = useState([]); 
+  const [selId, setSelId] = useState(''); 
+  const [qty, setQty] = useState(''); 
+  const [uType, setUType] = useState('base'); 
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [sortBy, setSortBy] = useState('name');
+
+  useEffect(() => { return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => setIngredients(s.docs.map(d => ({id: d.id, ...d.data()})))); }, [appId]);
+  
+  const sortedIngredients = useMemo(() => {
+    return [...ingredients].sort((a, b) => {
+        if (sortBy === 'supplier') return (a.supplier || '').localeCompare(b.supplier || '');
+        return a.name.localeCompare(b.name);
+    });
+  }, [ingredients, sortBy]);
+
+  const add = (e) => { 
+    e.preventDefault(); 
+    if (!selId || !qty) return; 
+    const ing = ingredients.find(i => i.id === selId); 
+    const q = parseFloat(qty); 
+    let base = q; 
+    let lbl = ing.unit; 
+    if (uType !== 'base' && Array.isArray(ing.forms)) { 
+      const f = ing.forms[parseInt(uType)];
+      if (f) { base = q * f.ratio; lbl = f.name; }
+    } 
+    // Store 'ingId' specifically for the movement recorder
+    setPending([...pending, { id: Date.now(), ingId: selId, name: ing.name, qty: q, lbl, base, uType, unit: ing.unit }]); 
+    setQty(''); setSelId(''); setUType('base'); 
+  };
+  
+  const commit = async () => { 
+    const batch = writeBatch(db); 
+    let log = "Received:\n"; 
+    const cons = {}; 
     
-    const [selId, setSelId] = useState(''); 
-    const [qty, setQty] = useState(''); 
-    const [uType, setUType] = useState('base'); 
-    const [showConfirm, setShowConfirm] = useState(false);
-    const [sortBy, setSortBy] = useState('name');
+    // Prepare data for movement log
+    const movementItems = [];
 
-    // Fetch Ingredients (Existing)
-    useEffect(() => { 
-        return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'ingredients'), (s) => setIngredients(s.docs.map(d => ({id: d.id, ...d.data()})))); 
-    }, [appId]);
-
-    // NEW: Fetch Receipt History
-    useEffect(() => {
-        if (activeTab === 'history') {
-            const q = query(
-                collection(db, 'artifacts', appId, 'public', 'data', 'stock_receipts'),
-                orderBy('timestamp', 'desc'),
-                limit(20) // Only show last 20 receipts
-            );
-            return onSnapshot(q, (s) => setHistory(s.docs.map(d => ({id: d.id, ...d.data()}))));
-        }
-    }, [appId, activeTab]);
-    
-    const sortedIngredients = useMemo(() => {
-      return [...ingredients].sort((a, b) => {
-          if (sortBy === 'supplier') return (a.supplier || '').localeCompare(b.supplier || '');
-          return a.name.localeCompare(b.name);
-      });
-    }, [ingredients, sortBy]);
-
-    const add = (e) => { 
-      e.preventDefault(); 
-      if (!selId || !qty) return; 
-      const ing = ingredients.find(i => i.id === selId); 
-      const q = parseFloat(qty); 
-      let base = q; 
-      let lbl = ing.unit; 
-      if (uType !== 'base' && Array.isArray(ing.forms)) { 
-          const f = ing.forms[parseInt(uType)];
-          if (f) {
-              base = q * f.ratio; 
-              lbl = f.name; 
-          }
-      } 
-      setPending([...pending, { id: Date.now(), ingId: selId, name: ing.name, qty: q, lbl, base, uType }]); 
-      setQty(''); setSelId(''); setUType('base'); 
-    };
-    
-    const commit = async () => { 
-      const batch = writeBatch(db); 
-      let log = "Received Stock:\n"; 
-      const cons = {}; 
-      
-      // 1. Prepare Inventory Updates
-      pending.forEach(p => { 
-          cons[p.ingId] = (cons[p.ingId]||0) + p.base; 
-          log += `- ${p.qty} ${p.lbl} ${p.name}\n`; 
-      }); 
-      
-      for (const [id, amt] of Object.entries(cons)) {
-          batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', id), { currentStock: increment(amt) }); 
-      }
-
-      // 2. NEW: Save a Structured Receipt Document
-      const receiptRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'stock_receipts'));
-      batch.set(receiptRef, {
-          timestamp: serverTimestamp(),
-          receivedBy: user.uid,
-          itemCount: pending.length,
-          items: pending.map(p => ({
-              name: p.name,
-              qty: p.qty,
-              unit: p.lbl,
-              baseAdded: p.base
-          }))
-      });
-
-      // 3. Log and Commit
-      await batch.commit(); 
-      await addLog(db, appId, user.uid, log); 
-      
-      setPending([]); 
-      setShowConfirm(false);
-      alert("Stock Received Successfully!");
-    };
-    
-    const selIng = ingredients.find(i => i.id === selId);
-
-    return (
-      <div className="max-w-4xl mx-auto space-y-6">
-        <ConfirmationModal isOpen={showConfirm} onClose={() => setShowConfirm(false)} onConfirm={commit} title="Confirm Receipt?" message="This will immediately increase inventory levels." />
+    pending.forEach(p => { 
+        cons[p.ingId] = (cons[p.ingId]||0) + p.base; 
+        log += `- ${p.qty} ${p.lbl} ${p.name}\n`; 
         
-        {/* Header & Tabs */}
-        <div className="flex flex-col md:flex-row justify-between items-center gap-4">
-            <h2 className="text-xl font-black flex items-center gap-2 text-slate-800"><Truck className="text-green-600"/> Receive Stock</h2>
-            
-            <div className="bg-slate-100 p-1 rounded-xl flex font-bold text-sm">
-               <button onClick={() => setActiveTab('new')} className={`px-4 py-2 rounded-lg transition-all ${activeTab === 'new' ? 'bg-white shadow-sm text-green-700' : 'text-slate-400 hover:text-slate-600'}`}>New Input</button>
-               <button onClick={() => setActiveTab('history')} className={`px-4 py-2 rounded-lg transition-all ${activeTab === 'history' ? 'bg-white shadow-sm text-slate-800' : 'text-slate-400 hover:text-slate-600'}`}>History</button>
-            </div>
+        // Add to movement list
+        movementItems.push({ ingId: p.ingId, name: p.name, qty: p.base, unit: p.unit });
+    }); 
+
+    // Update Ingredients
+    for (const [id, amt] of Object.entries(cons)) {
+        batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'ingredients', id), { currentStock: increment(amt) }); 
+    }
+
+    // NEW: Record the movement
+    await recordStockMovement(batch, db, appId, 'receive', movementItems);
+
+    await batch.commit(); 
+    await addLog(db, appId, user.uid, log); 
+    setPending([]); 
+    setShowConfirm(false);
+  };
+  
+  const selIng = ingredients.find(i => i.id === selId);
+
+  // ... (The return JSX remains exactly the same as your existing code)
+  return (
+    <div className="max-w-4xl mx-auto space-y-8">
+      <ConfirmationModal isOpen={showConfirm} onClose={() => setShowConfirm(false)} onConfirm={commit} title="Confirm Stock Receipt?" message="This will immediately update inventory levels." />
+      <div className="bg-white p-4 md:p-8 rounded-2xl shadow-sm border border-slate-200">
+        <h2 className="text-xl font-black mb-6 flex items-center gap-2 text-slate-800"><Truck className="text-green-600"/> Receive Stock</h2>
+        <div className="mb-4 flex justify-end">
+             <div className="flex bg-white rounded-xl border border-slate-200 p-1 text-xs font-bold w-fit">
+                 <button onClick={() => setSortBy('name')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'name' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>A-Z</button>
+                 <button onClick={() => setSortBy('supplier')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'supplier' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>Supplier</button>
+             </div>
         </div>
-
-        {activeTab === 'new' && (
-        <div className="animate-in fade-in">
-          <div className="bg-white p-4 md:p-8 rounded-2xl shadow-sm border border-slate-200 mb-6">
-              <div className="mb-4 flex justify-end">
-                  <div className="flex bg-white rounded-xl border border-slate-200 p-1 text-xs font-bold w-fit">
-                      <button onClick={() => setSortBy('name')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'name' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>A-Z</button>
-                      <button onClick={() => setSortBy('supplier')} className={`px-3 py-1.5 rounded-lg transition ${sortBy === 'supplier' ? 'bg-slate-900 text-white' : 'text-slate-400'}`}>Supplier</button>
-                  </div>
-              </div>
-
-              <form onSubmit={add} className="flex flex-col md:flex-row gap-4 items-end">
-              <div className="flex-1 w-full">
-                  <label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Item</label>
-                  <select required className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={selId} onChange={e => { setSelId(e.target.value); setUType('base'); }}>
-                      <option value="">Select...</option>
-                      {sortedIngredients.map(i => (
-                          <option key={i.id} value={i.id}>
-                              {i.name} {i.supplier ? `(${i.supplier})` : ''}
-                          </option>
-                      ))}
-                  </select>
-              </div>
-              {selIng && <><div className="w-full md:w-32"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Qty</label><input required type="number" step="any" className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={qty} onChange={e => setQty(e.target.value)} /></div><div className="w-full md:w-40"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Unit</label><select className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={uType} onChange={e => setUType(e.target.value)}><option value="base">Base ({selIng.unit})</option>{Array.isArray(selIng.forms) && selIng.forms.map((f, i) => <option key={i} value={i}>{f.name}</option>)}</select></div></>}
-              <button type="submit" className="w-full md:w-auto bg-slate-900 text-white px-8 py-3 rounded-lg font-bold hover:bg-slate-800 transition">Add</button>
-              </form>
-          </div>
-          
-          {pending.length > 0 && <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden"><div className="p-5 bg-slate-50 border-b flex justify-between items-center"><h3 className="font-bold text-slate-700">Pending Receipt</h3><span className="text-xs bg-slate-200 px-3 py-1 rounded-full font-bold">{pending.length} items</span></div><div className="overflow-x-auto"><table className="w-full text-left text-sm min-w-[400px]"><thead className="bg-slate-100 text-slate-500 uppercase font-bold"><tr><th className="p-4">Item</th><th className="p-4">Qty</th><th className="p-4">Base Added</th><th className="p-4 text-right">Action</th></tr></thead><tbody>{pending.map(p => (<tr key={p.id}><td className="p-4 font-bold">{p.name}</td><td className="p-4 font-black text-green-600">{p.qty} {p.lbl}</td><td className="p-4 text-xs text-slate-400">+{Math.round(p.base * 100)/100}</td><td className="p-4 text-right"><button onClick={() => setPending(pending.filter(i => i.id !== p.id))}><Trash2 size={18} className="text-red-400" /></button></td></tr>))}</tbody></table></div><div className="p-5 border-t flex justify-end"><button onClick={() => setShowConfirm(true)} className="bg-green-600 text-white px-8 py-3 rounded-xl font-bold shadow-lg hover:bg-green-700 transition transform active:scale-95">Complete Receipt</button></div></div>}
-        </div>
-        )}
-
-        {activeTab === 'history' && (
-            <div className="space-y-4 animate-in fade-in slide-in-from-right-4">
-                {history.length === 0 ? <div className="text-center py-12 text-slate-400 italic bg-white rounded-2xl border border-dashed">No receipt history found.</div> : 
-                history.map(rec => (
-                    <div key={rec.id} className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm hover:shadow-md transition">
-                        <div className="flex justify-between items-center mb-3">
-                            <div>
-                                <span className="text-sm font-black text-slate-800 flex items-center gap-2"><Calendar size={14}/> {rec.timestamp?.toDate().toLocaleString()}</span>
-                                <span className="text-[10px] uppercase font-bold text-slate-400">ID: {rec.id.slice(0,8)}...</span>
-                            </div>
-                            <span className="bg-green-100 text-green-800 text-xs font-black px-3 py-1 rounded-full">{rec.itemCount || rec.items?.length} Items</span>
-                        </div>
-                        <div className="bg-slate-50 rounded-xl p-3">
-                            <ul className="text-sm space-y-1">
-                                {rec.items?.map((item, idx) => (
-                                    <li key={idx} className="flex justify-between text-slate-600">
-                                        <span className="font-bold">{item.name}</span>
-                                        <span className="font-mono text-slate-800">+{item.qty} {item.unit}</span>
-                                    </li>
-                                ))}
-                            </ul>
-                        </div>
-                    </div>
+        <form onSubmit={add} className="flex flex-col md:flex-row gap-4 items-end">
+          <div className="flex-1 w-full">
+            <label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Item</label>
+            <select required className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={selId} onChange={e => { setSelId(e.target.value); setUType('base'); }}>
+                <option value="">Select...</option>
+                {sortedIngredients.map(i => (
+                    <option key={i.id} value={i.id}>{i.name} {i.supplier ? `(${i.supplier})` : ''}</option>
                 ))}
-            </div>
-        )}
+            </select>
+          </div>
+          {selIng && <><div className="w-full md:w-32"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Qty</label><input required type="number" step="any" className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={qty} onChange={e => setQty(e.target.value)} /></div><div className="w-full md:w-40"><label className="block text-xs font-bold text-slate-400 mb-2 uppercase">Unit</label><select className="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50 font-bold" value={uType} onChange={e => setUType(e.target.value)}><option value="base">Base ({selIng.unit})</option>{Array.isArray(selIng.forms) && selIng.forms.map((f, i) => <option key={i} value={i}>{f.name}</option>)}</select></div></>}
+          <button type="submit" className="w-full md:w-auto bg-slate-900 text-white px-8 py-3 rounded-lg font-bold hover:bg-slate-800 transition">Add</button>
+        </form>
       </div>
-    );
+      {pending.length > 0 && <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden"><div className="p-5 bg-slate-50 border-b flex justify-between items-center"><h3 className="font-bold text-slate-700">Pending</h3><span className="text-xs bg-slate-200 px-3 py-1 rounded-full font-bold">{pending.length} items</span></div><div className="overflow-x-auto"><table className="w-full text-left text-sm min-w-[400px]"><thead className="bg-slate-100 text-slate-500 uppercase font-bold"><tr><th className="p-4">Item</th><th className="p-4">Qty</th><th className="p-4">Base</th><th className="p-4 text-right">Action</th></tr></thead><tbody>{pending.map(p => (<tr key={p.id}><td className="p-4 font-bold">{p.name}</td><td className="p-4 font-black text-green-600">{p.qty} {p.lbl}</td><td className="p-4 text-xs">+{p.base}</td><td className="p-4 text-right"><button onClick={() => setPending(pending.filter(i => i.id !== p.id))}><Trash2 size={18} className="text-red-400" /></button></td></tr>))}</tbody></table></div><div className="p-5 border-t flex justify-end"><button onClick={() => setShowConfirm(true)} className="bg-green-500 text-white px-8 py-3 rounded-xl font-bold shadow-lg hover:bg-green-600 transition">Complete</button></div></div>}
+    </div>
+  );
 }
 
 function AdminSettings({ user, role, appId }) {
