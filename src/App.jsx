@@ -2144,26 +2144,3 @@ function AdminSettings({ user, role, appId }) {
     }
   };
 
-  return (
-    <div className="max-w-md mx-auto space-y-8 mt-10">
-      <PinModal isOpen={showResetPin} onClose={() => setShowResetPin(false)} onSuccess={resetStock} appId={appId} title="Confirm: Reset Stock" />
-      
-      <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
-          <h2 className="text-xl font-black mb-6">Update PIN</h2>
-          <form onSubmit={up} className="space-y-4">
-              <input className="w-full border p-3 rounded-lg" type="password" placeholder="Current" value={pin} onChange={e => setP(e.target.value)} />
-              <input className="w-full border p-3 rounded-lg" type="password" placeholder="New" value={nPin} onChange={e => setN(e.target.value)} />
-              <input className="w-full border p-3 rounded-lg" type="password" placeholder="Confirm" value={cPin} onChange={e => setC(e.target.value)} />
-              {msg && <p className="text-center font-bold text-sm">{msg}</p>}
-              <button className="w-full bg-slate-900 text-white py-3 rounded-lg font-bold">Update</button>
-          </form>
-      </div>
-
-      <div className="bg-red-50 p-8 rounded-2xl shadow-sm border border-red-100">
-          <h2 className="text-xl font-black mb-2 text-red-900 flex items-center gap-2"><AlertTriangle/> Danger Zone</h2>
-          <p className="text-sm text-red-800/70 mb-6 font-medium">Actions here are irreversible.</p>
-          <button onClick={() => setShowResetPin(true)} className="w-full bg-red-600 text-white py-3 rounded-lg font-bold hover:bg-red-700 shadow-md transition">Reset Inventory Levels to 0</button>
-      </div>
-    </div>
-  );
-}
